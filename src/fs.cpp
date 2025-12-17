@@ -603,15 +603,7 @@ public:
         DirEntry content[CLUSTER_SIZE / sizeof(DirEntry)];
         memset(content, 0, sizeof(content));
         
-        strcpy(content[0].name, ".");
-        content[0].type = TYPE_LEVELED_DIR;
-        content[0].startCluster = sb.rootDirCluster;
-        content[0].size = 0;
-        content[0].attributes = PERM_ROOT_DEFAULT;
-        content[0].createTime = (uint32_t)(timestamp & 0xFFFFFFFF);
-        content[0].modTime = (uint32_t)(timestamp & 0xFFFFFFFF);
-        
-        for (int i = 1; i < CLUSTER_SIZE / sizeof(DirEntry); i++) {
+        for (int i = 0; i < CLUSTER_SIZE / sizeof(DirEntry); i++) {
             content[i].type = TYPE_FREE;
             content[i].attributes = 0;
         }
