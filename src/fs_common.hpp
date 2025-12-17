@@ -26,6 +26,8 @@
 #include <algorithm>
 #include <map>
 #include <cstdint>
+#include <unordered_map>
+#include <list>
 
 #define SECTOR_SIZE 512
 #define CLUSTER_SIZE 4096 
@@ -240,6 +242,12 @@ struct VersionEntry {
 
 #pragma pack(pop)
 
+struct SectorCacheEntry {
+    uint8_t data[SECTOR_SIZE];
+    bool valid;
+    SectorCacheEntry() : valid(false) {}
+};
+
 class DiskDevice {
 private:
     HANDLE hDevice;
@@ -248,9 +256,36 @@ private:
     uint64_t baseOffset;
     bool verbose;
     bool isImageFile;
+    
+    bool cacheEnabled;
+    size_t cacheMaxSize;
+    list<uint64_t> cacheLRU;
+    unordered_map<uint64_t, list<uint64_t>::iterator> cacheMap;
+    unordered_map<uint64_t, SectorCacheEntry> cacheData;
+    
+    uint64_t cacheHits;
+    uint64_t cacheMisses;
+    
+    void touchCache(uint64_t sector) {
+        if (cacheMap.count(sector)) {
+            cacheLRU.erase(cacheMap[sector]);
+        }
+        cacheLRU.push_front(sector);
+        cacheMap[sector] = cacheLRU.begin();
+    }
+    
+    void evictOldest() {
+        if (cacheLRU.empty()) return;
+        uint64_t oldest = cacheLRU.back();
+        cacheLRU.pop_back();
+        cacheMap.erase(oldest);
+        cacheData.erase(oldest);
+    }
 
 public:
-    DiskDevice() : hDevice(INVALID_HANDLE_VALUE), baseOffset(0), verbose(false), isImageFile(false) {}
+    DiskDevice() : hDevice(INVALID_HANDLE_VALUE), baseOffset(0), verbose(false), 
+                   isImageFile(false), cacheEnabled(true), cacheMaxSize(2048),
+                   cacheHits(0), cacheMisses(0) {}
 
     void setVerbose(bool v) { verbose = v; }
 
@@ -326,6 +361,13 @@ public:
     }
 
     bool readSector(uint64_t sectorIndex, void* buffer, uint32_t count = 1) {
+        if (cacheEnabled && count == 1 && cacheData.count(sectorIndex) && cacheData[sectorIndex].valid) {
+            memcpy(buffer, cacheData[sectorIndex].data, SECTOR_SIZE);
+            touchCache(sectorIndex);
+            cacheHits++;
+            return true;
+        }
+        
         bool success = false;
         if (isImageFile) {
             if (!imageFile.is_open()) return false;
@@ -368,6 +410,17 @@ public:
                  cout << "[DISK] READ FAILED | Sector: " << sectorIndex << endl;
             }
         }
+        
+        if (success && cacheEnabled && count == 1) {
+            cacheMisses++;
+            if (cacheData.size() >= cacheMaxSize) {
+                evictOldest();
+            }
+            memcpy(cacheData[sectorIndex].data, buffer, SECTOR_SIZE);
+            cacheData[sectorIndex].valid = true;
+            touchCache(sectorIndex);
+        }
+        
         return success;
     }
 
@@ -400,6 +453,14 @@ public:
             imageFile.flush();
             bool success = !imageFile.fail();
             imageFile.clear();
+            
+            if (success && cacheEnabled && count == 1) {
+                if (cacheData.size() >= cacheMaxSize) evictOldest();
+                memcpy(cacheData[sectorIndex].data, buffer, SECTOR_SIZE);
+                cacheData[sectorIndex].valid = true;
+                touchCache(sectorIndex);
+            }
+            
             return success;
         } else {
             if (hDevice == INVALID_HANDLE_VALUE) return false;
@@ -413,6 +474,14 @@ public:
                  cout << "[DISK] CRITICAL ERROR: FlushFileBuffers failed. Error Code: " << err << endl;
                  return false;
             }
+            
+            if (cacheEnabled && count == 1) {
+                if (cacheData.size() >= cacheMaxSize) evictOldest();
+                memcpy(cacheData[sectorIndex].data, buffer, SECTOR_SIZE);
+                cacheData[sectorIndex].valid = true;
+                touchCache(sectorIndex);
+            }
+            
             return bytesWritten == count * SECTOR_SIZE;
         }
     }
@@ -439,6 +508,49 @@ public:
         return hDevice != INVALID_HANDLE_VALUE; 
     }
     string getPath() const { return currentPath; }
+    
+    void enableCache(bool enable) { cacheEnabled = enable; }
+    bool isCacheEnabled() const { return cacheEnabled; }
+    
+    void setCacheSize(size_t maxEntries) { 
+        cacheMaxSize = maxEntries;
+        while (cacheData.size() > cacheMaxSize) evictOldest();
+    }
+    
+    void clearCache() {
+        cacheLRU.clear();
+        cacheMap.clear();
+        cacheData.clear();
+    }
+    
+    void invalidateSector(uint64_t sector) {
+        if (cacheMap.count(sector)) {
+            cacheLRU.erase(cacheMap[sector]);
+            cacheMap.erase(sector);
+        }
+        cacheData.erase(sector);
+    }
+    
+    size_t getCacheSize() const { return cacheData.size(); }
+    size_t getCacheCapacity() const { return cacheMaxSize; }
+    uint64_t getCacheHits() const { return cacheHits; }
+    uint64_t getCacheMisses() const { return cacheMisses; }
+    
+    double getCacheHitRate() const {
+        uint64_t total = cacheHits + cacheMisses;
+        return total > 0 ? (double)cacheHits / total * 100.0 : 0.0;
+    }
+    
+    void displayCacheStats() const {
+        cout << "\n=== Cache Statistics ===\n";
+        cout << "  Status:    " << (cacheEnabled ? "ENABLED" : "DISABLED") << "\n";
+        cout << "  Entries:   " << cacheData.size() << " / " << cacheMaxSize << "\n";
+        cout << "  Hits:      " << cacheHits << "\n";
+        cout << "  Misses:    " << cacheMisses << "\n";
+        cout << "  Hit Rate:  " << fixed << setprecision(1) << getCacheHitRate() << "%\n";
+    }
+    
+    void resetCacheStats() { cacheHits = cacheMisses = 0; }
 };
 
 #endif

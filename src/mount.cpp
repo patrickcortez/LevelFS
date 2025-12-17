@@ -8,6 +8,7 @@
 #include "permissions.hpp"
 #include "fs_entry.hpp"
 #include "fs_context.hpp"
+#include "defrag.hpp"
 
 class FileSystemShell {
     DiskDevice disk;
@@ -1599,168 +1600,36 @@ found:
         }
     }
     
-    // Analyze fragmentation
+    // Analyze fragmentation using Defragmenter class
     void fragInfo() {
         if (!disk.isOpen()) return;
-        
-        cout << "\n=== Fragmentation Analysis ===\n\n";
-        
-        int totalFiles = 0;
-        int fragmentedFiles = 0;
-        int totalFragments = 0;
-        
-        // Scan current directory for files
-        vector<DirEntry> entries = readDirEntries(context.currentContentCluster);
-        
-        for (const auto& e : entries) {
-            if (e.type == TYPE_FILE && e.startCluster != 0) {
-                totalFiles++;
-                vector<uint64_t> chain = getChain(e.startCluster);
-                
-                int fragments = 1;
-                for (size_t i = 1; i < chain.size(); i++) {
-                    if (chain[i] != chain[i-1] + 1) fragments++;
-                }
-                
-                if (fragments > 1) {
-                    fragmentedFiles++;
-                    totalFragments += fragments;
-                    
-                    char nameBuf[25];
-                    strncpy(nameBuf, e.name, 24);
-                    nameBuf[24] = '\0';
-                    string displayName = nameBuf;
-                    if (e.extension[0]) {
-                        displayName += ".";
-                        displayName += e.extension;
-                    }
-                    cout << "  " << displayName << ": " << fragments << " fragments (" 
-                         << chain.size() << " clusters)\n";
-                }
-            }
-        }
-        
-        cout << "\nSummary:\n";
-        cout << "  Total files: " << totalFiles << "\n";
-        cout << "  Fragmented files: " << fragmentedFiles << "\n";
-        
-        if (totalFiles > 0) {
-            int pct = (fragmentedFiles * 100) / totalFiles;
-            cout << "  Fragmentation: " << pct << "%\n";
-        }
+        Defragmenter defragmenter(disk, sb);
+        defragmenter.analyze(context.currentContentCluster);
     }
     
-    // Defragment a single file
-    bool defragFile(DirEntry& entry, uint64_t entrySector, int entryIdx) {
-        if (entry.type != TYPE_FILE || entry.startCluster == 0) return true;
-        
-        vector<uint64_t> oldChain = getChain(entry.startCluster);
-        if (oldChain.size() <= 1) return true;  // Already contiguous or empty
-        
-        // Check if already contiguous
-        bool isContiguous = true;
-        for (size_t i = 1; i < oldChain.size(); i++) {
-            if (oldChain[i] != oldChain[i-1] + 1) {
-                isContiguous = false;
-                break;
-            }
-        }
-        if (isContiguous) return true;
-        
-        // Need to find contiguous space
-        uint64_t neededClusters = oldChain.size();
-        uint64_t newStart = 0;
-        uint64_t consecutive = 0;
-        uint64_t dataStart = sb.labPoolStart + sb.labPoolClusters;
-        
-        for (uint64_t c = dataStart; c < sb.totalClusters; c++) {
-            LABEntry lab = getLABEntry(c);
-            if (lab.nextCluster == LAT_FREE) {
-                if (consecutive == 0) newStart = c;
-                consecutive++;
-                if (consecutive >= neededClusters) break;
-            } else {
-                consecutive = 0;
-            }
-        }
-        
-        if (consecutive < neededClusters) {
-            return false;  // Not enough contiguous space
-        }
-        
-        // Copy data to new location
-        for (size_t i = 0; i < oldChain.size(); i++) {
-            uint8_t buffer[CLUSTER_SIZE];
-            for (int s = 0; s < 8; s++) {
-                disk.readSector(oldChain[i] * 8 + s, buffer + s * SECTOR_SIZE);
-            }
-            for (int s = 0; s < 8; s++) {
-                disk.writeSector((newStart + i) * 8 + s, buffer + s * SECTOR_SIZE);
-            }
-            
-            // Update LAT for new cluster
-            if (i < oldChain.size() - 1) {
-                setLATEntry(newStart + i, newStart + i + 1);
-            } else {
-                setLATEntry(newStart + i, LAT_END);
-            }
-            
-            // Free old cluster
-            setLATEntry(oldChain[i], LAT_FREE);
-        }
-        
-        // Update entry
-        DirEntry entries[SECTOR_SIZE/sizeof(DirEntry)];
-        disk.readSector(entrySector, entries);
-        entries[entryIdx].startCluster = newStart;
-        disk.writeSector(entrySector, entries);
-        
-        return true;
-    }
-    
-    // Defragment disk
-    void defrag() {
+    // Defragment disk using Defragmenter class
+    void defrag(int flags = DEFRAG_NONE) {
         if (!disk.isOpen()) return;
-        
-        cout << "\n=== Disk Defragmentation ===\n\n";
-        cout << "Analyzing fragmentation...\n";
-        
-        int defragged = 0;
-        int failed = 0;
-        
-        vector<uint64_t> chain = getChain(context.currentContentCluster);
-        for (uint64_t c : chain) {
-            for (int i = 0; i < 8; i++) {
-                DirEntry entries[SECTOR_SIZE/sizeof(DirEntry)];
-                disk.readSector(c * 8 + i, entries);
-                
-                for (int j = 0; j < SECTOR_SIZE/sizeof(DirEntry); j++) {
-                    if (entries[j].type == TYPE_FILE && entries[j].startCluster != 0) {
-                        entries[j].name[23] = '\0';
-                        string displayName = entries[j].name;
-                        if (entries[j].extension[0]) {
-                            displayName += ".";
-                            displayName += entries[j].extension;
-                        }
-                        
-                        cout << "  Processing: " << displayName << "... ";
-                        cout.flush();
-                        
-                        if (defragFile(entries[j], c * 8 + i, j)) {
-                            cout << "OK\n";
-                            defragged++;
-                        } else {
-                            cout << "SKIP (no contiguous space)\n";
-                            failed++;
-                        }
-                    }
-                }
-            }
+        Defragmenter defragmenter(disk, sb);
+        defragmenter.run(context.currentContentCluster, flags, context.currentPath);
+    }
+    
+    // Defrag with string flags from command line
+    void defragWithFlags(const string& flagStr) {
+        int flags = DEFRAG_NONE;
+        if (flagStr.find("-n") != string::npos || flagStr.find("--dry-run") != string::npos) {
+            flags |= DEFRAG_DRY_RUN;
         }
-        
-        cout << "\nDefragmentation complete.\n";
-        cout << "  Files processed: " << defragged << "\n";
-        cout << "  Files skipped: " << failed << "\n";
+        if (flagStr.find("-v") != string::npos || flagStr.find("--verbose") != string::npos) {
+            flags |= DEFRAG_VERBOSE;
+        }
+        if (flagStr.find("-f") != string::npos || flagStr.find("--force") != string::npos) {
+            flags |= DEFRAG_FORCE;
+        }
+        if (flagStr.find("-r") != string::npos || flagStr.find("--recursive") != string::npos) {
+            flags |= DEFRAG_RECURSIVE;
+        }
+        defrag(flags);
     }
     
     void createLevelMount(string path, uint64_t levelID) {
@@ -2482,6 +2351,34 @@ level_check_done:
         cout << "Level '" << levelName << "' not found in '" << folderName << "'.\n";
     }
 
+    bool isLevelShared(uint64_t contentCluster, uint64_t excludeFolderCluster) {
+        vector<uint64_t> chain = getChain(context.rootContentCluster);
+        for (uint64_t c : chain) {
+            for (int i = 0; i < 8; i++) {
+                DirEntry entries[SECTOR_SIZE / sizeof(DirEntry)];
+                disk.readSector(c * 8 + i, entries);
+                for (int j = 0; j < SECTOR_SIZE / sizeof(DirEntry); j++) {
+                    if (entries[j].type == TYPE_LEVELED_DIR && 
+                        entries[j].startCluster != 0 && 
+                        entries[j].startCluster != excludeFolderCluster) {
+                        
+                        char vpsBuf[SECTOR_SIZE];
+                        VersionEntry* vps = (VersionEntry*)vpsBuf;
+                        for (int s = 0; s < 8; s++) {
+                            disk.readSector(entries[j].startCluster * 8 + s, vpsBuf);
+                            for (int v = 0; v < SECTOR_SIZE / sizeof(VersionEntry); v++) {
+                                if (vps[v].isActive && vps[v].contentTableCluster == contentCluster) {
+                                    return true;
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        return false;
+    }
+
     void del(string path, bool recursive) {
         if (!disk.isOpen()) return;
         
@@ -2565,10 +2462,16 @@ level_check_done:
                             if (entries[j].type == TYPE_LEVELED_DIR) {
                                 char vpsBuf[SECTOR_SIZE];
                                 VersionEntry* vps = (VersionEntry*)vpsBuf;
-                                disk.readSector(entries[j].startCluster * 8, vpsBuf);
-                                for (int v = 0; v < SECTOR_SIZE/sizeof(VersionEntry); v++) {
-                                    if (vps[v].isActive && vps[v].contentTableCluster != 0) {
-                                        freeChain(vps[v].contentTableCluster);
+                                for (int s = 0; s < 8; s++) {
+                                    disk.readSector(entries[j].startCluster * 8 + s, vpsBuf);
+                                    for (int v = 0; v < SECTOR_SIZE/sizeof(VersionEntry); v++) {
+                                        if (vps[v].isActive && vps[v].contentTableCluster != 0) {
+                                            if (isLevelShared(vps[v].contentTableCluster, entries[j].startCluster)) {
+                                                cout << "  Level '" << vps[v].versionName << "' is shared, detaching (not deleted).\n";
+                                            } else {
+                                                freeChain(vps[v].contentTableCluster);
+                                            }
+                                        }
                                     }
                                 }
                                 freeChain(entries[j].startCluster);
@@ -2714,6 +2617,93 @@ found_src:
         }
         cout << "Level '" << oldName << "' not found.\n";
     }
+
+    void rename(string path, string newName) {
+        if (!disk.isOpen()) return;
+        
+        if (!(context.currentFolderPerms & PERM_WRITE)) {
+            cout << "Permission denied: current folder is read-only.\n";
+            return;
+        }
+        
+        size_t colonPos = path.find(':');
+        if (colonPos != string::npos && colonPos > 0) {
+            string folderName = path.substr(0, colonPos);
+            string levelName = path.substr(colonPos + 1);
+            renameLevel(folderName, levelName, newName);
+            return;
+        }
+        
+        PathResult res = resolvePath(path);
+        if (!res.valid) { cout << "Item not found.\n"; return; }
+        
+        if (newName.length() > 23) {
+            cout << "Name too long (max 23 characters).\n";
+            return;
+        }
+        
+        vector<uint64_t> chain = getChain(res.parentCluster);
+        for (uint64_t c : chain) {
+            for (int i = 0; i < 8; i++) {
+                DirEntry entries[SECTOR_SIZE / sizeof(DirEntry)];
+                disk.readSector(c * 8 + i, entries);
+                for (int j = 0; j < SECTOR_SIZE / sizeof(DirEntry); j++) {
+                    if (entries[j].type != TYPE_FREE && string(entries[j].name) == res.name) {
+                        if (!(entries[j].attributes & PERM_WRITE) && entries[j].type == TYPE_FILE) {
+                            cout << "Permission denied: no write access.\n";
+                            return;
+                        }
+                        
+                        strncpy(entries[j].name, newName.c_str(), 23);
+                        entries[j].name[23] = '\0';
+                        entries[j].modTime = time(0);
+                        disk.writeSector(c * 8 + i, entries);
+                        
+                        string typeStr = "item";
+                        if (entries[j].type == TYPE_FILE) typeStr = "file";
+                        else if (entries[j].type == TYPE_LEVELED_DIR) typeStr = "folder";
+                        else if (entries[j].type == TYPE_SYMLINK) typeStr = "symlink";
+                        
+                        cout << "Renamed " << typeStr << " '" << res.name << "' to '" << newName << "'.\n";
+                        return;
+                    }
+                }
+            }
+        }
+        cout << "Item not found.\n";
+    }
+    
+    void renameLevel(string folderName, string levelName, string newName) {
+        uint64_t folderCluster = findFolderCluster(folderName);
+        if (folderCluster == 0) {
+            cout << "Folder '" << folderName << "' not found.\n";
+            return;
+        }
+        
+        if (newName.length() > 31) {
+            cout << "Level name too long (max 31 characters).\n";
+            return;
+        }
+        
+        char vpsBuf[SECTOR_SIZE];
+        VersionEntry* vps = (VersionEntry*)vpsBuf;
+        
+        for (int s = 0; s < 8; s++) {
+            disk.readSector(folderCluster * 8 + s, vpsBuf);
+            for (int j = 0; j < SECTOR_SIZE / sizeof(VersionEntry); j++) {
+                if (vps[j].isActive && string(vps[j].versionName) == levelName) {
+                    strncpy(vps[j].versionName, newName.c_str(), 31);
+                    vps[j].versionName[31] = '\0';
+                    vps[j].modTime = time(0);
+                    disk.writeSector(folderCluster * 8 + s, vpsBuf);
+                    cout << "Renamed level '" << levelName << "' to '" << newName << "'.\n";
+                    return;
+                }
+            }
+        }
+        cout << "Level '" << levelName << "' not found in '" << folderName << "'.\n";
+    }
+
 
     void current() {
         if (!disk.isOpen()) {
@@ -2862,9 +2852,206 @@ scan_done:
         cout << "Written " << total << " bytes.\n";
     }
 
+    void writeInsert(string path) {
+        if (!disk.isOpen()) return;
+        
+        PathResult res = resolvePath(path);
+        if (!res.valid) { cout << "File not found.\n"; return; }
+        
+        DirEntry targetEntry;
+        uint64_t entrySector = 0;
+        int entryIdx = -1;
+        bool found = false;
+        
+        vector<uint64_t> chain = getChain(res.parentCluster);
+        for (uint64_t c : chain) {
+            for (int i = 0; i < 8; i++) {
+                DirEntry entries[SECTOR_SIZE / sizeof(DirEntry)];
+                disk.readSector(c * 8 + i, entries);
+                for (int j = 0; j < SECTOR_SIZE / sizeof(DirEntry); j++) {
+                    if (entries[j].type == TYPE_FILE && string(entries[j].name) == res.name) {
+                        targetEntry = entries[j];
+                        entrySector = c * 8 + i;
+                        entryIdx = j;
+                        found = true;
+                        goto found_file;
+                    }
+                }
+            }
+        }
+found_file:
+        if (!found) { cout << "File not found.\n"; return; }
+        
+        if (!(targetEntry.attributes & PERM_WRITE)) {
+            cout << "Permission denied: no write access.\n";
+            return;
+        }
+        
+        vector<string> lines;
+        if (targetEntry.startCluster != 0 && targetEntry.size > 0) {
+            string content;
+            vector<uint64_t> fileChain = getChain(targetEntry.startCluster);
+            uint64_t remaining = targetEntry.size;
+            
+            for (uint64_t c : fileChain) {
+                if (remaining == 0) break;
+                char buffer[CLUSTER_SIZE];
+                for (int s = 0; s < 8; s++) {
+                    disk.readSector(c * 8 + s, buffer + s * SECTOR_SIZE);
+                }
+                uint64_t toRead = min((uint64_t)CLUSTER_SIZE, remaining);
+                content.append(buffer, toRead);
+                remaining -= toRead;
+            }
+            
+            stringstream ss(content);
+            string line;
+            while (getline(ss, line)) {
+                lines.push_back(line);
+            }
+        }
+        
+        if (lines.empty()) {
+            cout << "File is empty. Use 'write' instead.\n";
+            return;
+        }
+        
+        int selectedLine = 0;
+        bool done = false;
+        
+        cout << "\n=== Insert Mode ===\n";
+        cout << "Use UP/DOWN arrows to select line, ENTER to insert before it, ESC to cancel.\n\n";
+        
+        HANDLE hConsole = GetStdHandle(STD_INPUT_HANDLE);
+        DWORD oldMode;
+        GetConsoleMode(hConsole, &oldMode);
+        SetConsoleMode(hConsole, 0);
+        
+        auto displayLines = [&]() {
+            cout << "\033[2J\033[H";
+            cout << "=== Insert Mode: " << res.name << " ===\n";
+            cout << "UP/DOWN to navigate, ENTER to insert before selected line, ESC to cancel\n";
+            cout << string(50, '-') << "\n";
+            
+            for (size_t i = 0; i < lines.size(); i++) {
+                if ((int)i == selectedLine) {
+                    cout << ">> ";
+                } else {
+                    cout << "   ";
+                }
+                cout << setw(3) << (i + 1) << ": ";
+                if (lines[i].length() > 60) {
+                    cout << lines[i].substr(0, 57) << "...";
+                } else {
+                    cout << lines[i];
+                }
+                cout << "\n";
+            }
+            cout << string(50, '-') << "\n";
+            cout << "Selected: Line " << (selectedLine + 1) << "\n";
+        };
+        
+        displayLines();
+        
+        while (!done) {
+            INPUT_RECORD ir;
+            DWORD count;
+            if (ReadConsoleInput(hConsole, &ir, 1, &count)) {
+                if (ir.EventType == KEY_EVENT && ir.Event.KeyEvent.bKeyDown) {
+                    switch (ir.Event.KeyEvent.wVirtualKeyCode) {
+                        case VK_UP:
+                            if (selectedLine > 0) selectedLine--;
+                            displayLines();
+                            break;
+                        case VK_DOWN:
+                            if (selectedLine < (int)lines.size() - 1) selectedLine++;
+                            displayLines();
+                            break;
+                        case VK_RETURN: {
+                            SetConsoleMode(hConsole, oldMode);
+                            cout << "\nEnter line to insert (or empty to cancel): ";
+                            string newLine;
+                            getline(cin, newLine);
+                            
+                            if (!newLine.empty()) {
+                                lines.insert(lines.begin() + selectedLine, newLine);
+                                
+                                string newContent;
+                                for (const auto& l : lines) {
+                                    newContent += l + "\n";
+                                }
+                                
+                                vector<uint8_t> data(newContent.begin(), newContent.end());
+                                
+                                DirEntry entries[SECTOR_SIZE / sizeof(DirEntry)];
+                                disk.readSector(entrySector, entries);
+                                entries[entryIdx].size = data.size();
+                                entries[entryIdx].modTime = time(0);
+                                disk.writeSector(entrySector, entries);
+                                
+                                uint64_t current = targetEntry.startCluster;
+                                uint64_t offset = 0;
+                                uint64_t total = data.size();
+                                
+                                while (offset < total) {
+                                    uint64_t chunk = min((uint64_t)CLUSTER_SIZE, total - offset);
+                                    uint8_t buffer[CLUSTER_SIZE];
+                                    memset(buffer, 0, CLUSTER_SIZE);
+                                    memcpy(buffer, data.data() + offset, chunk);
+                                    
+                                    for (int s = 0; s < 8; s++) {
+                                        disk.writeSector(current * 8 + s, buffer + s * SECTOR_SIZE);
+                                    }
+                                    
+                                    offset += chunk;
+                                    
+                                    if (offset < total) {
+                                        uint64_t next = getLATEntry(current);
+                                        if (next == LAT_END || next == 0) {
+                                            next = allocCluster();
+                                            if (next == 0) { cout << "Disk full.\n"; break; }
+                                            setLATEntry(current, next);
+                                        }
+                                        current = next;
+                                    }
+                                }
+                                setLATEntry(current, LAT_END);
+                                
+                                cout << "Inserted line at position " << (selectedLine + 1) << ".\n";
+                            } else {
+                                cout << "Cancelled.\n";
+                            }
+                            done = true;
+                            break;
+                        }
+                        case VK_ESCAPE:
+                            done = true;
+                            cout << "\nCancelled.\n";
+                            break;
+                    }
+                }
+            }
+        }
+        
+        SetConsoleMode(hConsole, oldMode);
+    }
+
     void setVerbose(bool v) {
         disk.setVerbose(v);
         cout << "Disk logging " << (v ? "ENABLED" : "DISABLED") << ".\n";
+    }
+    
+    void enableDiskCache(bool enable) {
+        disk.enableCache(enable);
+    }
+    
+    void clearDiskCache() {
+        disk.clearCache();
+        disk.resetCacheStats();
+    }
+    
+    void showCacheStats() {
+        disk.displayCacheStats();
     }
     
     void listAllLevels() {
@@ -2972,6 +3159,23 @@ int main(int argc, char** argv) {
                 else if (state == "off") fs.setVerbose(false);
                 else cout << "Usage: log <on|off>\n";
             }
+            else if (cmd == "cache") {
+                string sub; ss >> sub;
+                if (sub == "on") {
+                    fs.enableDiskCache(true);
+                    cout << "Cache ENABLED.\n";
+                } else if (sub == "off") {
+                    fs.enableDiskCache(false);
+                    cout << "Cache DISABLED.\n";
+                } else if (sub == "clear") {
+                    fs.clearDiskCache();
+                    cout << "Cache cleared.\n";
+                } else if (sub == "stats") {
+                    fs.showCacheStats();
+                } else {
+                    cout << "Usage: cache <on|off|clear|stats>\n";
+                }
+            }
             else if (cmd == "look") {
                 string arg; ss >> arg;
                 if (arg == "-d") {
@@ -3075,14 +3279,32 @@ int main(int argc, char** argv) {
                 else fs.createHardlink(link, target);
             }
             else if (cmd == "write") {
-                string file; ss >> file;
-                if (file.empty()) cout << "Usage: write <filename>\n";
-                else fs.write(file);
+                string sub, file;
+                ss >> sub;
+                if (sub == "insert") {
+                    ss >> file;
+                    if (file.empty()) cout << "Usage: write insert <filename>\n";
+                    else fs.writeInsert(file);
+                } else if (!sub.empty()) {
+                    fs.write(sub);
+                } else {
+                    cout << "Usage: write <filename> or write insert <filename>\n";
+                }
+            }
+            else if (cmd == "rename") {
+                string path, newName;
+                ss >> path >> newName;
+                if (path.empty() || newName.empty()) {
+                    cout << "Usage: rename <path|folder:level> <newname>\n";
+                } else {
+                    fs.rename(path, newName);
+                }
             }
             else if (cmd == "help") {
                 cout << "Commands:\n";
                 cout << "  mount <D|auto> - Mount drive letter or auto-scan\n";
                 cout << "  log <on|off>  - Toggle disk op logging\n";
+                cout << "  cache <on|off|clear|stats> - Cache control\n";
                 cout << "  look          - List directory contents\n";
                 cout << "  look <folder> - List levels of a folder\n";
                 cout << "  look <f>:<l>  - List contents of folder:level\n";
@@ -3093,13 +3315,15 @@ int main(int argc, char** argv) {
                 cout << "  create folder <n> - Create folder\n";
                 cout << "  create file <n> [ext] - Create file (e.g. readme txt)\n";
                 cout << "  write <name>  - Text editor for file\n";
+                cout << "  write insert <name> - Insert line at position (arrow keys)\n";
                 cout << "  read <name>   - Read file contents\n";
+                cout << "  rename <path> <newname> - Rename file/folder/level\n";
                 cout << "  perms <+/-rwx> <file> - Set permissions (+r,-w,+x...)\n";
                 cout << "  symlink <target> <link> - Create symbolic link\n";
                 cout << "  hardlink <target> <link> - Create hard link\n";
                 cout << "  mount-level <path> <id> - Mount level by ID at path\n";
                 cout << "  nav <path>    - Navigate to folder\n";
-                cout << "  del <name>    - Delete entry\n";
+                cout << "  del <name>    - Delete entry (links preserved)\n";
                 cout << "  move <s> <d>  - Move/rename entry\n";
                 cout << "  level add <f> <n>    - Add level to folder/.\n";
                 cout << "  level branch <f> <p> <n> - Branch level from parent\n";
@@ -3107,12 +3331,21 @@ int main(int argc, char** argv) {
                 cout << "  link <dir1> <dir2> <level> - Create shared level (DAG)\n";
                 cout << "  fsck          - Check filesystem integrity\n";
                 cout << "  fraginfo      - Show fragmentation info\n";
-                cout << "  defrag        - Defragment disk\n";
+                cout << "  defrag [-nvfr] - Defragment disk\n";
+                cout << "                  -n/--dry-run: analyze only\n";
+                cout << "                  -v/--verbose: detailed output\n";
+                cout << "                  -f/--force: force processing\n";
+                cout << "                  -r/--recursive: include subdirs\n";
                 cout << "  exit          - Exit\n";
             }
             else if (cmd == "fsck") fs.fsck();
             else if (cmd == "fraginfo") fs.fragInfo();
-            else if (cmd == "defrag") fs.defrag();
+            else if (cmd == "defrag") {
+                string flags;
+                getline(ss, flags);
+                if (flags.empty()) fs.defrag();
+                else fs.defragWithFlags(flags);
+            }
             else cout << "Unknown command. Type 'help' for list.\n";
         } catch (const exception& e) {
             cout << "Error: " << e.what() << "\n";
