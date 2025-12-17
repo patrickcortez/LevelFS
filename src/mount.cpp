@@ -171,19 +171,20 @@ public:
             cout << "  Active Level: master (ID: " << context.currentLevelID << ")\n";
             context.rootContentCluster = context.currentContentCluster;
         } else {
-            cout << "No master version found. Creating...\n";
-            VersionEntry vps[SECTOR_SIZE/sizeof(VersionEntry)];
-            memset(vps, 0, sizeof(vps));
-            strcpy(vps[0].versionName, "master");
-            vps[0].isActive = 1;
-            vps[0].contentTableCluster = allocCluster();
-            vps[0].levelID = LEVEL_ID_MASTER;
-            vps[0].parentLevelID = LEVEL_ID_NONE;
-            vps[0].flags = LEVEL_FLAG_ACTIVE;
-            disk.writeSector(sb.rootDirCluster * 8, vps);
-            loadVersion("master");
-            context.rootContentCluster = context.currentContentCluster;
-        }
+        cout << "No master version found. Creating...\n";
+        char vpsBuf[SECTOR_SIZE];
+        VersionEntry* vps = (VersionEntry*)vpsBuf;
+        memset(vpsBuf, 0, SECTOR_SIZE);
+        strcpy(vps[0].versionName, "master");
+        vps[0].isActive = 1;
+        vps[0].contentTableCluster = allocCluster();
+        vps[0].levelID = LEVEL_ID_MASTER;
+        vps[0].parentLevelID = LEVEL_ID_NONE;
+        vps[0].flags = LEVEL_FLAG_ACTIVE;
+        disk.writeSector(sb.rootDirCluster * 8, vpsBuf);
+        loadVersion("master");
+        context.rootContentCluster = context.currentContentCluster;
+    }    
         return true;
     }
     
@@ -480,10 +481,11 @@ public:
         vector<uint64_t> chain = getChain(context.currentDirCluster);
         
         for (uint64_t c : chain) {
-            VersionEntry vps[SECTOR_SIZE/sizeof(VersionEntry)];
-            for (int i=0; i<8; i++) {
-                disk.readSector(c * 8 + i, vps);
-                for(int j=0; j<SECTOR_SIZE/sizeof(VersionEntry); j++) {
+        char vpsBuf[SECTOR_SIZE];
+        for (int i=0; i<8; i++) {
+             disk.readSector(c * 8 + i, vpsBuf);
+             VersionEntry* vps = (VersionEntry*)vpsBuf;
+             for(int j=0; j<SECTOR_SIZE/sizeof(VersionEntry); j++) {
                     if (vps[j].isActive && string(vps[j].versionName) == ver) {
                         context.currentContentCluster = vps[j].contentTableCluster;
                         context.currentLevelID = vps[j].levelID;
@@ -559,11 +561,12 @@ public:
 
             if (!found) return {0, "", false};
 
-            VersionEntry vps[SECTOR_SIZE/sizeof(VersionEntry)];
+            char vpsBuf[SECTOR_SIZE];
+            VersionEntry* vps = (VersionEntry*)vpsBuf;
             bool levelFound = false;
             uint64_t nextContent = 0;
             for (int s = 0; s < 8; s++) {
-                disk.readSector(folderCluster * 8 + s, vps);
+                disk.readSector(folderCluster * 8 + s, vpsBuf);
                 for (int j = 0; j < SECTOR_SIZE/sizeof(VersionEntry); j++) {
                     if (vps[j].isActive && string(vps[j].versionName) == levelName) {
                         nextContent = vps[j].contentTableCluster;
@@ -641,19 +644,21 @@ public:
              
              if (levelName.empty()) {
                   cout << "Levels of " << folderName << ":\n";
-                  VersionEntry vps[SECTOR_SIZE/sizeof(VersionEntry)];
+                  char vpsBuf[SECTOR_SIZE];
+                  VersionEntry* vps = (VersionEntry*)vpsBuf;
                   for (int i=0; i<8; i++) {
-                      disk.readSector(foundCluster * 8 + i, vps);
+                      disk.readSector(foundCluster * 8 + i, vpsBuf);
                       for (int j=0; j<SECTOR_SIZE/sizeof(VersionEntry); j++) {
                           if (vps[j].isActive) cout << " [" << vps[j].versionName << "]\n";
                       }
                   }
                   return;
              } else {
-                 VersionEntry vps[SECTOR_SIZE/sizeof(VersionEntry)];
+                 char vpsBuf[SECTOR_SIZE];
+                 VersionEntry* vps = (VersionEntry*)vpsBuf;
                  bool lvlFound = false;
                  for (int i=0; i<8; i++) {
-                     disk.readSector(foundCluster * 8 + i, vps);
+                     disk.readSector(foundCluster * 8 + i, vpsBuf);
                      for (int j=0; j<SECTOR_SIZE/sizeof(VersionEntry); j++) {
                          if (vps[j].isActive && string(vps[j].versionName) == levelName) {
                              contentCluster = vps[j].contentTableCluster;
@@ -754,10 +759,11 @@ public:
         
         if (levelName.empty()) {
             cout << "Levels of '" << folderName << "':\n";
-            VersionEntry vps[SECTOR_SIZE/sizeof(VersionEntry)];
+            char vpsBuf[SECTOR_SIZE];
+            VersionEntry* vps = (VersionEntry*)vpsBuf;
             int count = 0;
             for (int i=0; i<8; i++) {
-                disk.readSector(folderCluster * 8 + i, vps);
+                disk.readSector(folderCluster * 8 + i, vpsBuf);
                 for (int j=0; j<SECTOR_SIZE/sizeof(VersionEntry); j++) {
                     if (vps[j].isActive) {
                         cout << "  [" << vps[j].versionName << "]\n";
@@ -767,10 +773,11 @@ public:
             }
             if (count == 0) cout << "  (no levels)\n";
         } else {
-            VersionEntry vps[SECTOR_SIZE/sizeof(VersionEntry)];
+            char vpsBuf[SECTOR_SIZE];
+            VersionEntry* vps = (VersionEntry*)vpsBuf;
             uint64_t contentCluster = 0;
             for (int i=0; i<8; i++) {
-                disk.readSector(folderCluster * 8 + i, vps);
+                disk.readSector(folderCluster * 8 + i, vpsBuf);
                 for (int j=0; j<SECTOR_SIZE/sizeof(VersionEntry); j++) {
                     if (vps[j].isActive && string(vps[j].versionName) == levelName) {
                         contentCluster = vps[j].contentTableCluster;
@@ -815,7 +822,9 @@ public:
             for (int j=0; j<SECTOR_SIZE/sizeof(DirEntry); j++) {
                 if (entries[j].type == TYPE_LEVELED_DIR) {
                     entries[j].name[23] = '\0';
-                    folders.push_back({string(entries[j].name), entries[j].startCluster});
+                    if (string(entries[j].name) == "." || string(entries[j].name) == "..") continue;
+                if (entries[j].startCluster == 0) continue;
+                folders.push_back({string(entries[j].name), entries[j].startCluster});
                 } else if (entries[j].type == TYPE_FILE) {
                     entries[j].name[23] = '\0';
                     entries[j].extension[7] = '\0';
@@ -838,9 +847,10 @@ public:
             bool last = (i == folders.size() - 1);
             cout << prefix << (last ? "└── " : "├── ") << "[" << folders[i].first << "]" << "\n";
             
-            VersionEntry vps[SECTOR_SIZE/sizeof(VersionEntry)];
+            char vpsBuf[SECTOR_SIZE];
             for (int s=0; s<8; s++) {
-                disk.readSector(folders[i].second * 8 + s, vps);
+                disk.readSector(folders[i].second * 8 + s, vpsBuf);
+                VersionEntry* vps = (VersionEntry*)vpsBuf;
                 for (int j=0; j<SECTOR_SIZE/sizeof(VersionEntry); j++) {
                     if (vps[j].isActive) {
                         string newPrefix = prefix + (last ? "    " : "│   ");
@@ -850,8 +860,9 @@ public:
                         }
                         if (lastLevel) {
                             for (int ns=s+1; ns<8 && lastLevel; ns++) {
-                                VersionEntry vp2[SECTOR_SIZE/sizeof(VersionEntry)];
-                                disk.readSector(folders[i].second * 8 + ns, vp2);
+                                char vp2Buf[SECTOR_SIZE];
+                                disk.readSector(folders[i].second * 8 + ns, vp2Buf);
+                                VersionEntry* vp2 = (VersionEntry*)vp2Buf;
                                 for (int k=0; k<SECTOR_SIZE/sizeof(VersionEntry); k++) {
                                     if (vp2[k].isActive) { lastLevel = false; break; }
                                 }
@@ -1053,14 +1064,29 @@ found_slot:
         if (type == "folder") {
             target->type = TYPE_LEVELED_DIR;
             target->startCluster = allocCluster();
+            if (target->startCluster == 0) {
+                cout << "Disk full. Cannot create folder version table.\n";
+                target->type = TYPE_FREE; // Mark entry as free again
+                disk.writeSector(targetCluster * 8 + freeSector, entries); // Write back to disk
+                return;
+            }
             target->attributes = PERM_DIR_DEFAULT;
             
             if (target->startCluster != 0) {
-                VersionEntry vTable[CLUSTER_SIZE / sizeof(VersionEntry)];
-                memset(vTable, 0, sizeof(vTable));
+                char vTableBuf[CLUSTER_SIZE];
+                VersionEntry* vTable = (VersionEntry*)vTableBuf;
+                memset(vTableBuf, 0, sizeof(vTableBuf));
                 strcpy(vTable[0].versionName, "master");
                 vTable[0].isActive = 1;
                 vTable[0].contentTableCluster = allocCluster();
+                if (vTable[0].contentTableCluster == 0) {
+                    cout << "Disk full. Cannot create folder content table.\n";
+                    // Need to free previously allocated cluster for version table
+                    setLATEntry(target->startCluster, LAT_FREE);
+                    target->type = TYPE_FREE; // Mark entry as free again
+                    disk.writeSector(targetCluster * 8 + freeSector, entries); // Write back to disk
+                    return;
+                }
                 vTable[0].levelID = context.currentLevelID;
                 vTable[0].parentLevelID = context.rootLevelID;
                 vTable[0].flags = LEVEL_FLAG_ACTIVE;
@@ -1071,7 +1097,7 @@ found_slot:
                 vTable[0].isSnapshot = 0;
                 
                 for (int s = 0; s < 8; s++) {
-                    disk.writeSector(target->startCluster * 8 + s, ((char*)vTable) + s * SECTOR_SIZE);
+                    disk.writeSector(target->startCluster * 8 + s, vTableBuf + s * SECTOR_SIZE);
                 }
                 
                 if (vTable[0].contentTableCluster != 0) {
@@ -1095,6 +1121,12 @@ found_slot:
         } else {
             target->type = TYPE_FILE;
             target->startCluster = allocCluster();
+            if (target->startCluster == 0) {
+                cout << "Disk full. Cannot create file content.\n";
+                target->type = TYPE_FREE; // Mark entry as free again
+                disk.writeSector(targetCluster * 8 + freeSector, entries); // Write back to disk
+                return;
+            }
             target->size = 0;
             target->attributes = PERM_DEFAULT;
         }
@@ -1201,8 +1233,9 @@ found_slot:
                     for (int j = 0; j < SECTOR_SIZE/sizeof(DirEntry); j++) {
                         if (entries[j].type == TYPE_LEVELED_DIR && string(entries[j].name) == res.name) {
                             // Need to pick a level - use first active
-                            VersionEntry vps[SECTOR_SIZE/sizeof(VersionEntry)];
-                            disk.readSector(entries[j].startCluster * 8, vps);
+                            char vpsBuf[SECTOR_SIZE];
+                            VersionEntry* vps = (VersionEntry*)vpsBuf;
+                            disk.readSector(entries[j].startCluster * 8, vpsBuf);
                             for (int v = 0; v < SECTOR_SIZE/sizeof(VersionEntry); v++) {
                                 if (vps[v].isActive) {
                                     contentCluster = vps[v].contentTableCluster;
@@ -1318,9 +1351,10 @@ found:
             int levelCount = 0;
             vector<uint64_t> chain = getChain(sb.levelRegistryCluster);
             for (uint64_t c : chain) {
-                LevelDescriptor reg[SECTOR_SIZE / sizeof(LevelDescriptor)];
+                char regBuf[SECTOR_SIZE];
+                LevelDescriptor* reg = (LevelDescriptor*)regBuf;
                 for (int s = 0; s < 8; s++) {
-                    disk.readSector(c * 8 + s, reg);
+                    disk.readSector(c * 8 + s, regBuf); // Read into buffer
                     for (int j = 0; j < SECTOR_SIZE / sizeof(LevelDescriptor); j++) {
                         if (reg[j].flags & LEVEL_FLAG_ACTIVE) levelCount++;
                     }
@@ -1597,17 +1631,17 @@ found:
     void updateLevelDescriptor(LevelDescriptor& updated) {
         vector<uint64_t> chain = getChain(sb.levelRegistryCluster);
         for (uint64_t c : chain) {
-            LevelDescriptor registry[CLUSTER_SIZE / sizeof(LevelDescriptor)];
+            char registryBuf[CLUSTER_SIZE];
+            LevelDescriptor* registry = (LevelDescriptor*)registryBuf;
             for (int s = 0; s < SECTORS_PER_CLUSTER; s++) {
-                disk.readSector(c * SECTORS_PER_CLUSTER + s,
-                    ((char*)registry) + s * SECTOR_SIZE);
+                 disk.readSector(c * SECTORS_PER_CLUSTER + s, registryBuf + s * SECTOR_SIZE);
             }
             for (int j = 0; j < CLUSTER_SIZE / sizeof(LevelDescriptor); j++) {
                 if (registry[j].levelID == updated.levelID) {
                     registry[j] = updated;
                     for (int s = 0; s < SECTORS_PER_CLUSTER; s++) {
                         disk.writeSector(c * SECTORS_PER_CLUSTER + s,
-                            ((char*)registry) + s * SECTOR_SIZE);
+                            registryBuf + s * SECTOR_SIZE);
                     }
                     return;
                 }
@@ -1680,14 +1714,15 @@ found:
     }
     
     void enterFolder(uint64_t cluster, string name, string level) {
-        VersionEntry vps[SECTOR_SIZE/sizeof(VersionEntry)];
-        vector<string> versions;
-        for (int i=0; i<8; i++) {
-             disk.readSector(cluster * 8 + i, vps);
-             for(int j=0; j<SECTOR_SIZE/sizeof(VersionEntry); j++) {
-                 if (vps[j].isActive) versions.push_back(vps[j].versionName);
-             }
-        }
+    char vpsBuf[SECTOR_SIZE];
+    vector<string> versions;
+    for (int i=0; i<8; i++) {
+         disk.readSector(cluster * 8 + i, vpsBuf);
+         VersionEntry* vps = (VersionEntry*)vpsBuf;
+         for(int j=0; j<SECTOR_SIZE/sizeof(VersionEntry); j++) {
+             if (vps[j].isActive) versions.push_back(vps[j].versionName);
+         }
+    }
         if (versions.empty()) {
             cout << "Folder " << name << " has no versions.\n";
             cout << "Create default 'main'? (y/n): ";
@@ -1703,19 +1738,21 @@ found:
             cout << "\nSelect version: ";
             cin >> level;
         }
-        bool found = false;
-        uint64_t newContent = 0;
-        for (int i=0; i<8; i++) {
-             disk.readSector(cluster * 8 + i, vps);
-             for(int j=0; j<SECTOR_SIZE/sizeof(VersionEntry); j++) {
-                 if (vps[j].isActive && string(vps[j].versionName) == level) {
-                     newContent = vps[j].contentTableCluster;
-                     found = true;
-                     break;
-                 }
+    // Find content
+    uint64_t newContent = 0;
+    bool found = false;
+    for (int i=0; i<8; i++) {
+         disk.readSector(cluster * 8 + i, vpsBuf);
+         VersionEntry* vps = (VersionEntry*)vpsBuf;
+         for(int j=0; j<SECTOR_SIZE/sizeof(VersionEntry); j++) {
+             if (vps[j].isActive && string(vps[j].versionName) == level) {
+                 newContent = vps[j].contentTableCluster;
+                 found = true;
+                 break;
              }
-             if(found) break;
-        }
+         }
+         if(found) break;
+    }    
         if (!found) { cout << "Version not found.\n"; return; }
         context.currentDirCluster = cluster;
         context.currentContentCluster = newContent;
@@ -1740,9 +1777,10 @@ found:
         vector<uint64_t> chain = getChain(sb.levelRegistryCluster);
         
         for (uint64_t c : chain) {
-            LevelDescriptor registry[SECTOR_SIZE / sizeof(LevelDescriptor)];
+            char registryBuf[SECTOR_SIZE];
+            LevelDescriptor* registry = (LevelDescriptor*)registryBuf;
             for (int s = 0; s < 8; s++) {
-                disk.readSector(c * 8 + s, registry);
+                disk.readSector(c * 8 + s, registryBuf);
                 for (int j = 0; j < SECTOR_SIZE / sizeof(LevelDescriptor); j++) {
                     if (registry[j].levelID == 0 && !(registry[j].flags & LEVEL_FLAG_ACTIVE)) {
                         strcpy(registry[j].name, name.c_str());
@@ -1754,7 +1792,7 @@ found:
                         registry[j].flags = LEVEL_FLAG_ACTIVE;
                         registry[j].refCount = 1;
                         registry[j].childCount = 0;
-                        disk.writeSector(c * 8 + s, registry);
+                        disk.writeSector(c * 8 + s, registryBuf);
                         
                         writeSuperBlock();
                         return newLevelID;
@@ -1778,9 +1816,10 @@ found:
         vector<uint64_t> chain = getChain(cluster);
         
         for (uint64_t c : chain) {
-            VersionEntry vps[SECTOR_SIZE/sizeof(VersionEntry)];
+            char vpsBuf[SECTOR_SIZE];
+            VersionEntry* vps = (VersionEntry*)vpsBuf;
             for (int i=0; i<8; i++) {
-                 disk.readSector(c * 8 + i, vps);
+                 disk.readSector(c * 8 + i, vpsBuf);
                  for(int j=0; j<SECTOR_SIZE/sizeof(VersionEntry); j++) {
                      if (!vps[j].isActive) {
                          strcpy(vps[j].versionName, name.c_str());
@@ -1789,7 +1828,7 @@ found:
                          vps[j].levelID = newLevelID;
                          vps[j].parentLevelID = context.currentLevelID;
                          vps[j].flags = LEVEL_FLAG_ACTIVE;
-                         disk.writeSector(c * 8 + i, vps);
+                         disk.writeSector(c * 8 + i, vpsBuf);
                          cout << "Added level '" << name << "' (ID: " << newLevelID << ", Parent: " << context.currentLevelID << ")\n";
                          return;
                      }
@@ -1806,15 +1845,16 @@ found:
         
         setLATEntry(lastCluster, newCluster);
         
-        VersionEntry vps[SECTOR_SIZE/sizeof(VersionEntry)];
-        memset(vps, 0, sizeof(vps));
+        char vpsBuf[SECTOR_SIZE];
+        VersionEntry* vps = (VersionEntry*)vpsBuf;
+        memset(vpsBuf, 0, sizeof(vpsBuf));
         strcpy(vps[0].versionName, name.c_str());
         vps[0].contentTableCluster = cont;
         vps[0].isActive = 1;
         vps[0].levelID = newLevelID;
         vps[0].parentLevelID = context.currentLevelID;
         vps[0].flags = LEVEL_FLAG_ACTIVE;
-        for (int i=0; i<8; i++) disk.writeSector(newCluster * 8 + i, vps);
+        for (int i=0; i<8; i++) disk.writeSector(newCluster * 8 + i, vpsBuf);
         cout << "Added level '" << name << "' (ID: " << newLevelID << ", extended chain)\n";
     }
     
@@ -1833,22 +1873,21 @@ found:
         
         vector<uint64_t> chain = getChain(folderCluster);
         for (uint64_t c : chain) {
-            VersionEntry vps[SECTOR_SIZE/sizeof(VersionEntry)];
-            for (int i = 0; i < 8; i++) {
-                disk.readSector(c * 8 + i, vps);
-                for (int j = 0; j < SECTOR_SIZE/sizeof(VersionEntry); j++) {
-                    if (vps[j].isActive && string(vps[j].versionName) == parentLevelName) {
-                        foundEntry = vps[j];
-                        parentLevelID = vps[j].levelID;
-                        parentEntry = &foundEntry;
-                        break;
-                    }
+        char vpsBuf[SECTOR_SIZE];
+        for (int i = 0; i < 8; i++) {
+            disk.readSector(c * 8 + i, vpsBuf);
+            VersionEntry* vps = (VersionEntry*)vpsBuf;
+            for (int j = 0; j < SECTOR_SIZE / sizeof(VersionEntry); j++) {
+                if (vps[j].isActive && string(vps[j].versionName) == parentLevelName) {
+                    parentEntry = &vps[j];
+                    foundEntry = vps[j];
+                    parentLevelID = vps[j].levelID;
+                    goto found_parent;
                 }
-                if (parentEntry) break;
             }
-            if (parentEntry) break;
         }
-        
+    }
+found_parent:
         if (!parentEntry) {
             cout << "Parent level '" << parentLevelName << "' not found.\n";
             return;
@@ -1878,10 +1917,11 @@ found:
         
         vector<uint64_t> regChain = getChain(sb.levelRegistryCluster);
         for (uint64_t c : regChain) {
-            LevelDescriptor registry[CLUSTER_SIZE / sizeof(LevelDescriptor)];
+            char registryBuf[CLUSTER_SIZE];
+            LevelDescriptor* registry = (LevelDescriptor*)registryBuf;
             for (int s = 0; s < SECTORS_PER_CLUSTER; s++) {
                 disk.readSector(c * SECTORS_PER_CLUSTER + s,
-                    ((char*)registry) + s * SECTOR_SIZE);
+                    registryBuf + s * SECTOR_SIZE);
             }
             for (int j = 0; j < CLUSTER_SIZE / sizeof(LevelDescriptor); j++) {
                 if (registry[j].levelID == 0 && !(registry[j].flags & LEVEL_FLAG_ACTIVE)) {
@@ -1897,7 +1937,7 @@ found:
                     
                     for (int s = 0; s < SECTORS_PER_CLUSTER; s++) {
                         disk.writeSector(c * SECTORS_PER_CLUSTER + s,
-                            ((char*)registry) + s * SECTOR_SIZE);
+                            registryBuf + s * SECTOR_SIZE);
                     }
                     goto registry_done;
                 }
@@ -1906,20 +1946,24 @@ found:
         registry_done:
         
         for (uint64_t c : chain) {
-            VersionEntry vps[SECTOR_SIZE/sizeof(VersionEntry)];
-            for (int i = 0; i < 8; i++) {
-                disk.readSector(c * 8 + i, vps);
-                for (int j = 0; j < SECTOR_SIZE/sizeof(VersionEntry); j++) {
-                    if (!vps[j].isActive) {
-                        strcpy(vps[j].versionName, newLevelName.c_str());
-                        vps[j].contentTableCluster = newContentCluster;
-                        vps[j].isActive = 1;
-                        vps[j].levelID = newLevelID;
-                        vps[j].parentLevelID = parentLevelID;
-                        vps[j].flags = LEVEL_FLAG_ACTIVE | LEVEL_FLAG_DERIVED;
-                        disk.writeSector(c * 8 + i, vps);
-                        
-                        writeSuperBlock();
+        char vpsBuf[SECTOR_SIZE];
+        for (int i = 0; i < 8; i++) {
+            disk.readSector(c * 8 + i, vpsBuf);
+            VersionEntry* vps = (VersionEntry*)vpsBuf;
+            for (int j = 0; j < SECTOR_SIZE / sizeof(VersionEntry); j++) {
+                if (!vps[j].isActive) {
+                    // Found free slot
+                    strcpy(vps[j].versionName, newLevelName.c_str());
+                    vps[j].contentTableCluster = newContentCluster; // Content is empty as per creation
+                    vps[j].isActive = 1;
+                    vps[j].createTime = time(0);
+                    vps[j].modTime = time(0);
+                    vps[j].levelID = newLevelID;
+                    vps[j].parentLevelID = parentLevelID;
+                    vps[j].flags = LEVEL_FLAG_ACTIVE | LEVEL_FLAG_DERIVED;
+                    disk.writeSector(c * 8 + i, vpsBuf);
+                    
+                    writeSuperBlock();
                         cout << "Branched level '" << newLevelName << "' (ID: " << newLevelID 
                              << ") from '" << parentLevelName << "' (ID: " << parentLevelID << ")\n";
                         return;
@@ -2043,16 +2087,17 @@ found:
         vector<uint64_t> chain = getChain(dirCluster);
         
         for (uint64_t c : chain) {
-            VersionEntry vps[SECTOR_SIZE/sizeof(VersionEntry)];
+            char vpsBuf[SECTOR_SIZE];
+            VersionEntry* vps = (VersionEntry*)vpsBuf;
             for (int i=0; i<8; i++) {
-                 disk.readSector(c * 8 + i, vps);
+                 disk.readSector(c * 8 + i, vpsBuf);
                  for(int j=0; j<SECTOR_SIZE/sizeof(VersionEntry); j++) {
                      if (!vps[j].isActive) {
                          // Found free slot
                          strcpy(vps[j].versionName, levelName.c_str());
                          vps[j].contentTableCluster = contentCluster;
                          vps[j].isActive = 1;
-                         disk.writeSector(c * 8 + i, vps);
+                         disk.writeSector(c * 8 + i, vpsBuf);
                          return true;
                      }
                  }
@@ -2067,12 +2112,13 @@ found:
         setLATEntry(lastCluster, newCluster);
         
         // Initialize new cluster
-        VersionEntry vps[SECTOR_SIZE/sizeof(VersionEntry)];
-        memset(vps, 0, sizeof(vps));
-        strcpy(vps[0].versionName, levelName.c_str());
-        vps[0].contentTableCluster = contentCluster;
-        vps[0].isActive = 1;
-        for (int i=0; i<8; i++) disk.writeSector(newCluster * 8 + i, vps);
+    char vpsBuf[SECTOR_SIZE];
+    VersionEntry* vps = (VersionEntry*)vpsBuf;
+    memset(vpsBuf, 0, sizeof(vpsBuf));
+    strcpy(vps[0].versionName, levelName.c_str());
+    vps[0].contentTableCluster = contentCluster;
+    vps[0].isActive = 1;
+    for (int i=0; i<8; i++) disk.writeSector(newCluster * 8 + i, vpsBuf);
         
         return true;
     }
@@ -2215,9 +2261,10 @@ found:
                 for (int j=0; j<SECTOR_SIZE/sizeof(DirEntry); j++) {
                     if (entries[j].type != TYPE_FREE && string(entries[j].name) == res.name) {
                         if (entries[j].type == TYPE_LEVELED_DIR && !recursive) {
-                             VersionEntry vps[SECTOR_SIZE/sizeof(VersionEntry)];
+                             char vpsBuf[SECTOR_SIZE];
+                             VersionEntry* vps = (VersionEntry*)vpsBuf;
                              for(int k=0; k<8; k++) {
-                                 disk.readSector(entries[j].startCluster*8 + k, vps);
+                                 disk.readSector(entries[j].startCluster*8 + k, vpsBuf);
                                  for(int l=0; l<SECTOR_SIZE/sizeof(VersionEntry); l++) {
                                      if(vps[l].isActive) {
                                          cout << "Folder not empty. Use -r.\n";
@@ -2251,8 +2298,9 @@ found:
                         
                         if (entries[j].startCluster != 0 && entries[j].type != TYPE_SYMLINK) {
                             if (entries[j].type == TYPE_LEVELED_DIR) {
-                                VersionEntry vps[SECTOR_SIZE/sizeof(VersionEntry)];
-                                disk.readSector(entries[j].startCluster * 8, vps);
+                                char vpsBuf[SECTOR_SIZE];
+                                VersionEntry* vps = (VersionEntry*)vpsBuf;
+                                disk.readSector(entries[j].startCluster * 8, vpsBuf);
                                 for (int v = 0; v < SECTOR_SIZE/sizeof(VersionEntry); v++) {
                                     if (vps[v].isActive && vps[v].contentTableCluster != 0) {
                                         freeChain(vps[v].contentTableCluster);
@@ -2352,9 +2400,11 @@ found_src:
             cout << "Folder '" << folderName << "' not found.\n";
             return;
         }
-        VersionEntry vps[SECTOR_SIZE/sizeof(VersionEntry)];
+        char vpsBuf[SECTOR_SIZE];
+        VersionEntry* vps = (VersionEntry*)vpsBuf;
         for (int i=0; i<8; i++) {
-             disk.readSector(cluster * 8 + i, vps);
+             disk.readSector(cluster * 8 + i, vpsBuf);
+             vps = (VersionEntry*)vpsBuf;
              for(int j=0; j<SECTOR_SIZE/sizeof(VersionEntry); j++) {
                  if (vps[j].isActive && string(vps[j].versionName) == levelName) {
                      if (levelName == "master") {
@@ -2362,7 +2412,7 @@ found_src:
                          return;
                      }
                      vps[j].isActive = 0;
-                     disk.writeSector(cluster * 8 + i, vps);
+                     disk.writeSector(cluster * 8 + i, vpsBuf);
                      cout << "Removed level " << levelName << " from " << folderName << endl;
                      return;
                  }
@@ -2378,13 +2428,15 @@ found_src:
             cout << "Folder '" << folderName << "' not found.\n";
             return;
         }
-        VersionEntry vps[SECTOR_SIZE/sizeof(VersionEntry)];
+        char vpsBuf[SECTOR_SIZE];
+        VersionEntry* vps = (VersionEntry*)vpsBuf;
         for (int i=0; i<8; i++) {
-             disk.readSector(cluster * 8 + i, vps);
+             disk.readSector(cluster * 8 + i, vpsBuf);
+             vps = (VersionEntry*)vpsBuf;
              for(int j=0; j<SECTOR_SIZE/sizeof(VersionEntry); j++) {
                  if (vps[j].isActive && string(vps[j].versionName) == oldName) {
                      strcpy(vps[j].versionName, newName.c_str());
-                     disk.writeSector(cluster * 8 + i, vps);
+                     disk.writeSector(cluster * 8 + i, vpsBuf);
                      cout << "Renamed level " << oldName << " to " << newName << " in " << folderName << "\n";
                      return;
                  }
@@ -2559,9 +2611,10 @@ scan_done:
         vector<uint64_t> chain = getChain(sb.levelRegistryCluster);
         
         for (uint64_t c : chain) {
-            LevelDescriptor registry[SECTOR_SIZE / sizeof(LevelDescriptor)];
+            char registryBuf[SECTOR_SIZE];
+            LevelDescriptor* registry = (LevelDescriptor*)registryBuf;
             for (int s = 0; s < 8; s++) {
-                disk.readSector(c * 8 + s, registry);
+                disk.readSector(c * 8 + s, registryBuf);
                 for (int j = 0; j < SECTOR_SIZE / sizeof(LevelDescriptor); j++) {
                     if (registry[j].flags & LEVEL_FLAG_ACTIVE) {
                         string flagStr = "";
@@ -2589,6 +2642,7 @@ scan_done:
 };
 
 int main(int argc, char** argv) {
+    SetConsoleOutputCP(65001); // Enable UTF-8 output
     FileSystemShell fs;
     string input;
     
