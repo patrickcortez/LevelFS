@@ -9,11 +9,13 @@
 #include "fs_entry.hpp"
 #include "fs_context.hpp"
 #include "defrag.hpp"
+#include "concurrent.hpp"
 
 class FileSystemShell {
     DiskDevice disk;
     SuperBlock sb;
     Journal* journal;
+    FileLockManager lockManager;
     
     PermissionCache permCache;
     EntryReader* entryReader;
@@ -3054,6 +3056,57 @@ found_file:
         disk.displayCacheStats();
     }
     
+    bool lockFile(const string& filename, bool exclusive = true) {
+        PathResult res = resolvePath(filename);
+        if (!res.valid) { cout << "File not found.\n"; return false; }
+        
+        vector<uint64_t> chain = getChain(res.parentCluster);
+        for (uint64_t c : chain) {
+            for (int i = 0; i < 8; i++) {
+                DirEntry entries[SECTOR_SIZE / sizeof(DirEntry)];
+                disk.readSector(c * 8 + i, entries);
+                for (int j = 0; j < SECTOR_SIZE / sizeof(DirEntry); j++) {
+                    if (entries[j].type == TYPE_FILE && string(entries[j].name) == res.name) {
+                        LfsLockType type = exclusive ? LFS_LOCK_EXCLUSIVE : LFS_LOCK_SHARED;
+                        LfsLockStatus status = lockManager.acquireFileLock(
+                            entries[j].startCluster, filename, type, 3000);
+                        return status == LFS_LOCK_ACQUIRED;
+                    }
+                }
+            }
+        }
+        cout << "File not found.\n";
+        return false;
+    }
+    
+    bool unlockFile(const string& filename) {
+        PathResult res = resolvePath(filename);
+        if (!res.valid) { cout << "File not found.\n"; return false; }
+        
+        vector<uint64_t> chain = getChain(res.parentCluster);
+        for (uint64_t c : chain) {
+            for (int i = 0; i < 8; i++) {
+                DirEntry entries[SECTOR_SIZE / sizeof(DirEntry)];
+                disk.readSector(c * 8 + i, entries);
+                for (int j = 0; j < SECTOR_SIZE / sizeof(DirEntry); j++) {
+                    if (entries[j].type == TYPE_FILE && string(entries[j].name) == res.name) {
+                        return lockManager.releaseFileLock(entries[j].startCluster);
+                    }
+                }
+            }
+        }
+        cout << "File not found.\n";
+        return false;
+    }
+    
+    void showLocks() {
+        lockManager.displayLocks();
+    }
+    
+    void setLockVerbose(bool v) {
+        lockManager.setVerbose(v);
+    }
+
     void listAllLevels() {
         if (!disk.isOpen()) { cout << "Not mounted.\n"; return; }
         if (sb.levelRegistryCluster == 0) { cout << "No Level Registry.\n"; return; }
@@ -3175,6 +3228,38 @@ int main(int argc, char** argv) {
                 } else {
                     cout << "Usage: cache <on|off|clear|stats>\n";
                 }
+            }
+            else if (cmd == "lock") {
+                string sub, file;
+                ss >> sub >> file;
+                if (sub == "file" && !file.empty()) {
+                    if (fs.lockFile(file, true)) {
+                        cout << "Acquired EXCLUSIVE lock on '" << file << "'.\n";
+                    } else {
+                        cout << "Failed to acquire lock.\n";
+                    }
+                } else if (sub == "share" && !file.empty()) {
+                    if (fs.lockFile(file, false)) {
+                        cout << "Acquired SHARED lock on '" << file << "'.\n";
+                    } else {
+                        cout << "Failed to acquire lock.\n";
+                    }
+                } else {
+                    cout << "Usage: lock <file|share> <filename>\n";
+                }
+            }
+            else if (cmd == "unlock") {
+                string file; ss >> file;
+                if (file.empty()) {
+                    cout << "Usage: unlock <filename>\n";
+                } else if (fs.unlockFile(file)) {
+                    cout << "Released lock on '" << file << "'.\n";
+                } else {
+                    cout << "No lock held on '" << file << "'.\n";
+                }
+            }
+            else if (cmd == "locks") {
+                fs.showLocks();
             }
             else if (cmd == "look") {
                 string arg; ss >> arg;
@@ -3305,6 +3390,9 @@ int main(int argc, char** argv) {
                 cout << "  mount <D|auto> - Mount drive letter or auto-scan\n";
                 cout << "  log <on|off>  - Toggle disk op logging\n";
                 cout << "  cache <on|off|clear|stats> - Cache control\n";
+                cout << "  lock <file|share> <name> - Lock file (exclusive/shared)\n";
+                cout << "  unlock <name> - Release lock\n";
+                cout << "  locks         - Show active locks\n";
                 cout << "  look          - List directory contents\n";
                 cout << "  look <folder> - List levels of a folder\n";
                 cout << "  look <f>:<l>  - List contents of folder:level\n";

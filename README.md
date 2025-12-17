@@ -80,7 +80,7 @@ sudo ./fs format    # Interactive disk selection
 └── Sys/
     ├── :master
     │   └── people.txt
-    └── :exp (linked)  ←── Same content as Local/:exp
+    └── :exp (linked)  ←── Same content as Local:exp
         └── shared.txt
 ```
 
