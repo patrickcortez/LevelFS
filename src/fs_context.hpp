@@ -24,6 +24,7 @@ struct NavigationContext {
     uint32_t currentFolderPerms;
     string currentPath;
     string currentVersion;
+    string rootVersion;
     
     NavigationContext() {
         currentDirCluster = 0;
@@ -34,6 +35,7 @@ struct NavigationContext {
         currentFolderPerms = PERM_ROOT_DEFAULT;
         currentPath = "/";
         currentVersion = "master";
+        rootVersion = "master";
     }
     
     void reset(uint64_t rootDir, uint64_t rootContent, uint64_t rootLevel) {
@@ -45,6 +47,7 @@ struct NavigationContext {
         currentFolderPerms = PERM_ROOT_DEFAULT;
         currentPath = "/";
         currentVersion = "master";
+        rootVersion = "master";
     }
     
     bool isAtRoot() const {
@@ -349,12 +352,11 @@ public:
     }
     
     void goToRoot() {
-        context.currentDirCluster = context.currentDirCluster;
         context.currentContentCluster = context.rootContentCluster;
         context.currentLevelID = context.rootLevelID;
         context.currentFolderPerms = PERM_ROOT_DEFAULT;
         context.currentPath = "/";
-        context.currentVersion = "master";
+        context.currentVersion = context.rootVersion.empty() ? "master" : context.rootVersion;
     }
     
     void switchVersion(const string& version, uint64_t contentCluster, uint64_t levelID) {

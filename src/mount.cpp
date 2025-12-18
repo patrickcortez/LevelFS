@@ -23,23 +23,13 @@ class FileSystemShell {
     EntryWriter* entryWriter;
     EntryFinder* entryFinder;
     
-    struct {
-        uint64_t currentDirCluster; 
-        uint64_t currentContentCluster; 
-        uint64_t rootContentCluster;
-        uint64_t currentLevelID;
-        uint64_t rootLevelID;
-        uint32_t currentFolderPerms;
-        string currentPath;
-        string currentVersion;
-        string rootVersion;
-    } context;
+    NavigationContext context;
+    ContextManager* ctxManager;
+    PermissionResolver* permResolver;
 
 public:
-    FileSystemShell() : journal(nullptr), entryReader(nullptr), entryWriter(nullptr), entryFinder(nullptr) {
-        memset(&context, 0, sizeof(context));
-        context.currentPath = "/";
-        context.currentFolderPerms = PERM_ROOT_DEFAULT;
+    FileSystemShell() : journal(nullptr), entryReader(nullptr), entryWriter(nullptr), entryFinder(nullptr), ctxManager(nullptr), permResolver(nullptr) {
+        ctxManager = new ContextManager(context, disk);
     }
     
     ~FileSystemShell() {
@@ -47,6 +37,8 @@ public:
         if (entryReader) delete entryReader;
         if (entryWriter) delete entryWriter;
         if (entryFinder) delete entryFinder;
+        if (ctxManager) delete ctxManager;
+        if (permResolver) delete permResolver;
     }
 
     LevelDescriptor* findLevelByID(uint64_t levelID) {
@@ -149,6 +141,9 @@ public:
             lout << "Context: master (Level ID: " << context.currentLevelID << ")\n";
             context.rootContentCluster = context.currentContentCluster;
             context.rootVersion = "master";
+            
+            if (permResolver) delete permResolver;
+            permResolver = new PermissionResolver(disk, permCache, context.rootContentCluster);
         } else {
             lout << "No master version.\n";
             context.rootContentCluster = 0;
@@ -575,15 +570,7 @@ public:
         }
         if (path.empty()) return {current, "", true};
 
-        size_t pos = 0;
-        string token;
-        vector<string> parts;
-        while ((pos = path.find('/')) != string::npos) {
-            token = path.substr(0, pos);
-            if (!token.empty()) parts.push_back(token);
-            path.erase(0, pos + 1);
-        }
-        if (!path.empty()) parts.push_back(path);
+        vector<string> parts = PathUtils::splitPath(path);
 
         if (parts.empty()) return {current, "", true};
 
@@ -647,8 +634,7 @@ public:
     void look(string target = "") {
         if (!disk.isOpen()) return;
         
-        // Check if current folder allows read (when looking at current dir)
-        if (target.empty() && !(context.currentFolderPerms & PERM_READ)) {
+        if (target.empty() && !ctxManager->canRead()) {
             lout << "Permission denied: no read access to current folder.\n";
             return;
         }
@@ -756,7 +742,7 @@ public:
                         else if (entries[j].type == TYPE_HARDLINK) typeStr = "<HDLINK>";
                         else if (entries[j].type == TYPE_LEVEL_MOUNT) typeStr = "<LVLMNT>";
                         
-                        entries[j].extension[7] = '\0';
+                        entries[j].extension[3] = '\0';
                         string displayName = entries[j].name;
                         if (entries[j].type == TYPE_FILE && entries[j].extension[0] != '\0') {
                             displayName += ".";
@@ -997,7 +983,7 @@ public:
             return;
         }
         
-        if (!(context.currentFolderPerms & PERM_WRITE)) {
+        if (!ctxManager->canWrite()) {
             lout << "Permission denied: current folder is read-only.\n";
             return;
         }
@@ -1051,7 +1037,7 @@ public:
             return;
         }
         
-        if (!(context.currentFolderPerms & PERM_WRITE)) {
+        if (!ctxManager->canWrite()) {
             lout << "Permission denied: current folder is read-only.\n";
             return;
         }
@@ -1112,8 +1098,7 @@ found_target:
     void create(string type, string path, string extension = "") {
         if (!disk.isOpen()) return;
         
-        // Check if current folder allows write
-        if (!(context.currentFolderPerms & PERM_WRITE)) {
+        if (!ctxManager->canWrite()) {
             lout << "Permission denied: current folder is read-only.\n";
             return;
         }
@@ -1125,6 +1110,15 @@ found_target:
     }
     
     void createInCluster(uint64_t contentCluster, string type, string name, string extension = "") {
+        if (!PathUtils::isValidName(name)) {
+            lout << "Invalid name: '" << name << "'. Names must be 1-23 chars without / \\ : * ? \" < > |\n";
+            return;
+        }
+        if (!extension.empty() && !PathUtils::isValidExtension(extension)) {
+            lout << "Invalid extension: '" << extension << "'. Extensions must be 1-7 chars.\n";
+            return;
+        }
+        
         DirEntry entries[SECTOR_SIZE/sizeof(DirEntry)];
         int freeSector = -1;
         int freeIdx = -1;
@@ -1179,12 +1173,16 @@ found_slot:
         
         DirEntry* target = &entries[freeIdx];
         memset(target, 0, sizeof(DirEntry));
-        strncpy(target->name, name.c_str(), 23);
+        string truncName = PathUtils::truncateName(name, 23);
+        string truncExt = PathUtils::truncateName(extension, 3);
+        strncpy(target->name, truncName.c_str(), 23);
         target->name[23] = '\0';
-        strncpy(target->extension, extension.c_str(), 7);
-        target->extension[7] = '\0';
+        strncpy(target->extension, truncExt.c_str(), 3);
+        target->extension[3] = '\0';
         target->createTime = time(0);
         target->modTime = time(0);
+        target->accessTime = time(0);
+        target->ownerLevel = static_cast<uint8_t>(context.currentLevelID & 0xFF);
         
         if (type == "folder") {
             target->type = TYPE_LEVELED_DIR;
@@ -1296,12 +1294,29 @@ found_slot:
     }
     
     uint32_t getEntryPermsFromDisk(uint64_t cluster, const string& name) {
-        if (!entryFinder) return PERM_DEFAULT;
-        FindResult result = entryFinder->findByName(cluster, name);
+        if (!permResolver) return PERM_DEFAULT;
+        PermissionResult result = permResolver->readEntryPerms(cluster, name, nullptr);
         if (result.found) {
-            return result.entry.attributes;
+            return result.perms;
         }
         return PERM_DEFAULT;
+    }
+    
+    void updateAccessTime(uint64_t parentCluster, const string& name) {
+        vector<uint64_t> chain = getChain(parentCluster);
+        for (uint64_t c : chain) {
+            for (int i = 0; i < 8; i++) {
+                DirEntry entries[SECTOR_SIZE / sizeof(DirEntry)];
+                disk.readSector(c * 8 + i, entries);
+                for (int j = 0; j < SECTOR_SIZE / sizeof(DirEntry); j++) {
+                    if (entries[j].type != TYPE_FREE && string(entries[j].name) == name) {
+                        entries[j].accessTime = time(0);
+                        disk.writeSector(c * 8 + i, entries);
+                        return;
+                    }
+                }
+            }
+        }
     }
     
     void setLevelPerms(string options, string folderName, string levelName) {
@@ -1352,33 +1367,30 @@ found_slot:
         PathResult res = resolvePath(path);
         if (!res.valid) { lout << "Item not found.\n"; return; }
         
-        DirEntry entries[SECTOR_SIZE/sizeof(DirEntry)];
-        vector<uint64_t> chain = getChain(res.parentCluster);
-        
-        for (uint64_t c : chain) {
-            for (int i = 0; i < 8; i++) {
-                disk.readSector(c * 8 + i, entries);
-                for (int j = 0; j < SECTOR_SIZE/sizeof(DirEntry); j++) {
-                    if (entries[j].type != TYPE_FREE && string(entries[j].name) == res.name) {
-                        // Parse options: +r, -r, +w, -w, +e, -e
-                        if (options == "+r") entries[j].attributes |= PERM_READ;
-                        else if (options == "-r") entries[j].attributes &= ~PERM_READ;
-                        else if (options == "+w") entries[j].attributes |= PERM_WRITE;
-                        else if (options == "-w") entries[j].attributes &= ~PERM_WRITE;
-                        else if (options == "+x") entries[j].attributes |= PERM_EXEC;
-                        else if (options == "-x") entries[j].attributes &= ~PERM_EXEC;
-                        else { lout << "Invalid option. Use +r,-r,+w,-w,+x,-x\n"; return; }
-                        
-                        entries[j].modTime = time(0);
-                        disk.writeSector(c * 8 + i, entries);
-                        permCache.clear();
-                        lout << "Permissions: " << PermissionChecker::getPermsString(entries[j].attributes) << "\n";
-                        return;
-                    }
-                }
-            }
+        if (!PermissionChecker::isValidOption(options)) {
+            lout << "Invalid option. Use +r,-r,+w,-w,+x,-x,+h,-h,+s,-s\n";
+            return;
         }
-        lout << "File not found.\n";
+        
+        if (!permResolver) {
+            lout << "Permission resolver not initialized.\n";
+            return;
+        }
+        
+        PermissionResult current = permResolver->readEntryPerms(res.parentCluster, res.name, nullptr);
+        if (!current.found) {
+            lout << "File not found.\n";
+            return;
+        }
+        
+        uint32_t newPerms = PermissionChecker::parsePermString(options, current.perms);
+        PermissionResult result = permResolver->writeEntryPerms(res.parentCluster, res.name, newPerms);
+        
+        if (result.found) {
+            lout << "Permissions: " << PermissionChecker::getPermsString(result.perms) << "\n";
+        } else {
+            lout << "Failed to update permissions: " << result.errorMessage << "\n";
+        }
     }
     
     void lookDetailed(string path = "") {
@@ -1420,10 +1432,11 @@ found_slot:
         
 found:
         lout << "\n" << title << " (detailed):\n";
-        lout << string(70, '-') << "\n";
+        lout << string(90, '-') << "\n";
         lout << setw(8) << left << "Type" << " " << setw(5) << "Perms" << " " 
-             << setw(10) << right << "Size" << "  " << setw(16) << left << "Modified" << "  Name\n";
-        lout << string(70, '-') << "\n";
+             << setw(10) << right << "Size" << "  " << setw(16) << left << "Modified" << "  "
+             << setw(16) << left << "Accessed" << "  " << setw(3) << "Lvl" << "  Name\n";
+        lout << string(90, '-') << "\n";
         
         string permsStr = getPermsStr(context.currentFolderPerms);
         string nowStr = formatTime((uint32_t)time(nullptr));
@@ -1431,12 +1444,16 @@ found:
         lout << setw(8) << left << "<DIR>" << " " 
              << setw(5) << permsStr << " "
              << setw(10) << right << "-" << "  "
-             << setw(16) << left << nowStr << "  .\n";
+             << setw(16) << left << nowStr << "  "
+             << setw(16) << left << "-" << "  "
+             << setw(3) << "-" << "  .\n";
         
         lout << setw(8) << left << "<DIR>" << " " 
              << setw(5) << "rwx" << " "
              << setw(10) << right << "-" << "  "
-             << setw(16) << left << nowStr << "  ..\n";
+             << setw(16) << left << nowStr << "  "
+             << setw(16) << left << "-" << "  "
+             << setw(3) << "-" << "  ..\n";
         
         DirEntry entries[SECTOR_SIZE/sizeof(DirEntry)];
         bool empty = true;
@@ -1449,7 +1466,7 @@ found:
                     if (entries[j].type != TYPE_FREE && entries[j].name[0] != '\0') {
                         empty = false;
                         entries[j].name[23] = '\0';
-                        entries[j].extension[7] = '\0';
+                        entries[j].extension[3] = '\0';
                         
                         string typeStr;
                         if (entries[j].type == TYPE_LEVELED_DIR) typeStr = "<DIR>";
@@ -1468,18 +1485,22 @@ found:
                         string perms = getPermsStr(entries[j].attributes);
                         string sizeStr = (entries[j].type == TYPE_FILE) ? to_string(entries[j].size) : "-";
                         string modStr = formatTime(entries[j].modTime);
+                        string accessStr = formatTime(entries[j].accessTime);
+                        string levelStr = to_string(entries[j].ownerLevel);
                         
                         lout << setw(8) << left << typeStr << " " 
                              << setw(5) << perms << " "
                              << setw(10) << right << sizeStr << "  "
-                             << setw(16) << left << modStr << "  " 
+                             << setw(16) << left << modStr << "  "
+                             << setw(16) << left << accessStr << "  "
+                             << setw(3) << levelStr << "  "
                              << displayName << "\n";
                     }
                 }
             }
         }
         if (empty) lout << "(empty)\n";
-        lout << string(70, '-') << "\n";
+        lout << string(90, '-') << "\n";
     }
     
     // Filesystem check - validates integrity
@@ -1763,9 +1784,7 @@ found:
                         uint64_t mountedLevelID = entries[j].startCluster;
                         LevelDescriptor* level = findLevelByID(mountedLevelID);
                         if (level) {
-                            context.currentContentCluster = level->rootContentCluster;
-                            context.currentLevelID = level->levelID;
-                            context.currentVersion = level->name;
+                            ctxManager->switchVersion(level->name, level->rootContentCluster, level->levelID);
                             context.currentPath += folderName + "/";
                             lout << "Entered level mount '" << folderName << "' -> Level '" 
                                  << level->name << "' (ID: " << level->levelID << ")\n";
@@ -2310,6 +2329,8 @@ found_parent:
             remaining -= toRead;
         }
         lout << endl;
+        
+        updateAccessTime(res.parentCluster, res.name);
     }
 
     void deleteLevel(string folderName, string levelName) {

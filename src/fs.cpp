@@ -8,6 +8,8 @@
 #include <devguid.h>
 #include <ntddstor.h>
 
+static const wchar_t* LEVELFS_PARTITION_GUID = L"{4C455653-0001-4C46-5332-4C6576656C46}";
+
 struct PartitionResult {
     int diskIndex;
     uint64_t offset;
@@ -350,7 +352,7 @@ public:
         p->RewritePartition = TRUE;
         p->PartitionStyle = PARTITION_STYLE_GPT;
         memset(&p->Gpt.PartitionType, 0, sizeof(GUID));
-        CLSIDFromString(L"{EBD0A0A2-B9E5-4433-87C0-68B6B72699C7}", &p->Gpt.PartitionType);
+        CLSIDFromString(LEVELFS_PARTITION_GUID, &p->Gpt.PartitionType);
         CoCreateGuid(&p->Gpt.PartitionId);
         p->Gpt.Attributes = 0;
         wcscpy(p->Gpt.Name, L"Linuxify FS");
@@ -402,10 +404,10 @@ public:
                          // Update info
                          PARTITION_INFORMATION_EX* p = &layout->PartitionEntry[i];
                          
-                         // Set type to Basic Data {EBD0A0A2-B9E5-4433-87C0-68B6B72699C7} if not already
-                         GUID basicData;
-                         CLSIDFromString(L"{EBD0A0A2-B9E5-4433-87C0-68B6B72699C7}", &basicData);
-                         p->Gpt.PartitionType = basicData;
+                         // Set type to LevelFS custom GUID
+                         GUID levelfsType;
+                         CLSIDFromString(LEVELFS_PARTITION_GUID, &levelfsType);
+                         p->Gpt.PartitionType = levelfsType;
                          p->RewritePartition = TRUE;
                          wcscpy(p->Gpt.Name, L"Linuxify FS");
                          modified = true;

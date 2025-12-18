@@ -154,14 +154,16 @@ enum EntryType {
 
 struct DirEntry {
     char name[24];
-    char extension[8];
+    char extension[4];
     uint8_t type;
+    uint8_t ownerLevel;
+    uint8_t reserved[2];
     uint64_t startCluster;
     uint64_t size;
     uint32_t attributes;
     uint32_t createTime;
     uint32_t modTime;
-    char padding[3];
+    uint32_t accessTime;
 };
 
 /*
