@@ -22,6 +22,15 @@ public:
         uint64_t length;
     };
 
+    struct PartitionInfo {
+        int index;
+        uint64_t offset;
+        uint64_t size;
+        string type;
+        string name;
+        bool isSystem;
+    };
+
     static vector<UnallocatedChunk> getUnallocatedSpace(int diskIndex) {
         vector<UnallocatedChunk> chunks;
         string path = "\\\\.\\PhysicalDrive" + to_string(diskIndex);
@@ -70,6 +79,55 @@ public:
         }
         CloseHandle(hDevice);
         return chunks;
+    }
+
+    static vector<PartitionInfo> getPartitions(int diskIndex) {
+        vector<PartitionInfo> parts;
+        string path = "\\\\.\\PhysicalDrive" + to_string(diskIndex);
+        HANDLE hDevice = CreateFileA(path.c_str(), GENERIC_READ, FILE_SHARE_READ | FILE_SHARE_WRITE, NULL, OPEN_EXISTING, 0, NULL);
+        if (hDevice == INVALID_HANDLE_VALUE) return parts;
+
+        const int layoutSize = sizeof(DRIVE_LAYOUT_INFORMATION_EX) + sizeof(PARTITION_INFORMATION_EX) * 128;
+        vector<char> layoutBuf(layoutSize);
+        DRIVE_LAYOUT_INFORMATION_EX* layout = (DRIVE_LAYOUT_INFORMATION_EX*)layoutBuf.data();
+        DWORD bytesRet;
+
+        if (DeviceIoControl(hDevice, IOCTL_DISK_GET_DRIVE_LAYOUT_EX, NULL, 0, layout, layoutSize, &bytesRet, NULL)) {
+            for (DWORD i = 0; i < layout->PartitionCount; i++) {
+                PARTITION_INFORMATION_EX* p = &layout->PartitionEntry[i];
+                if (p->PartitionLength.QuadPart == 0) continue;
+                
+                PartitionInfo info;
+                info.index = i + 1;
+                info.offset = p->StartingOffset.QuadPart;
+                info.size = p->PartitionLength.QuadPart;
+                info.isSystem = false;
+                
+                if (layout->PartitionStyle == PARTITION_STYLE_GPT) {
+                    if (p->Gpt.Name[0] != 0) {
+                        char nameBuf[64];
+                        WideCharToMultiByte(CP_UTF8, 0, p->Gpt.Name, -1, nameBuf, 64, NULL, NULL);
+                        info.name = nameBuf;
+                    } else {
+                        info.name = "Unknown";
+                    }
+                    
+                    GUID efiGuid;
+                    CLSIDFromString(L"{C12A7328-F81F-11D2-BA4B-00A0C93EC93B}", &efiGuid);
+                    if (IsEqualGUID(p->Gpt.PartitionType, efiGuid)) {
+                        info.type = "EFI System";
+                        info.isSystem = true;
+                    } else {
+                        info.type = "Data";
+                    }
+                } else {
+                    info.type = "MBR";
+                }
+                parts.push_back(info);
+            }
+        }
+        CloseHandle(hDevice);
+        return parts;
     }
 
     static string getDiskModel(int diskIndex) {
@@ -325,6 +383,66 @@ public:
         return true;
     }
 
+    static bool preparePartitionForUse(int diskIndex, uint64_t offset, uint64_t size, char driveLetter) {
+        string path = "\\\\.\\PhysicalDrive" + to_string(diskIndex);
+        HANDLE hDevice = CreateFileA(path.c_str(), GENERIC_READ | GENERIC_WRITE, FILE_SHARE_READ | FILE_SHARE_WRITE, NULL, OPEN_EXISTING, 0, NULL);
+        if (hDevice == INVALID_HANDLE_VALUE) return false;
+        
+        const int layoutSize = sizeof(DRIVE_LAYOUT_INFORMATION_EX) + sizeof(PARTITION_INFORMATION_EX) * 128;
+        vector<char> layoutBuf(layoutSize);
+        DRIVE_LAYOUT_INFORMATION_EX* layout = (DRIVE_LAYOUT_INFORMATION_EX*)layoutBuf.data();
+        DWORD bytesRet;
+        
+        bool modified = false;
+        
+        if (DeviceIoControl(hDevice, IOCTL_DISK_GET_DRIVE_LAYOUT_EX, NULL, 0, layout, layoutSize, &bytesRet, NULL)) {
+            if (layout->PartitionStyle == PARTITION_STYLE_GPT) {
+                for (DWORD i = 0; i < layout->PartitionCount; i++) {
+                    if (layout->PartitionEntry[i].StartingOffset.QuadPart == offset) {
+                         // Update info
+                         PARTITION_INFORMATION_EX* p = &layout->PartitionEntry[i];
+                         
+                         // Set type to Basic Data {EBD0A0A2-B9E5-4433-87C0-68B6B72699C7} if not already
+                         GUID basicData;
+                         CLSIDFromString(L"{EBD0A0A2-B9E5-4433-87C0-68B6B72699C7}", &basicData);
+                         p->Gpt.PartitionType = basicData;
+                         p->RewritePartition = TRUE;
+                         wcscpy(p->Gpt.Name, L"Linuxify FS");
+                         modified = true;
+                         break;
+                    }
+                }
+            }
+        }
+        
+        if (modified) {
+            vector<HANDLE> volumeLocks = lockVolumesOnDisk(diskIndex);
+            bool res = DeviceIoControl(hDevice, IOCTL_DISK_SET_DRIVE_LAYOUT_EX, layout, layoutSize, NULL, 0, &bytesRet, NULL);
+            if (res) DeviceIoControl(hDevice, IOCTL_DISK_UPDATE_PROPERTIES, NULL, 0, NULL, 0, &bytesRet, NULL);
+            
+            for (HANDLE h : volumeLocks) {
+                 DeviceIoControl(h, FSCTL_UNLOCK_VOLUME, NULL, 0, NULL, 0, &bytesRet, NULL);
+                 CloseHandle(h);
+            }
+            if (!res) {
+                CloseHandle(hDevice);
+                return false;
+            }
+            cout << "Partition table updated.\n";
+            Sleep(2000); // Wait for refresh
+        }
+        
+        CloseHandle(hDevice);
+        
+        // Try to assign letter if persistent
+        if (!setDriveLetter(diskIndex, offset, driveLetter)) {
+             cout << "Could not assign drive letter automatically.\n";
+        } else {
+             cout << "Assigned " << driveLetter << ": to partition.\n";
+        }
+        return true;
+    }
+
     static PartitionResult createPartitionInteractive() {
         cout << "\n--- NATIVE PARTITION MANAGER ---\n";
         int bestDisk = -1;
@@ -332,20 +450,34 @@ public:
         
         for (int i=0; i<16; i++) {
              auto chunks = getUnallocatedSpace(i);
-             if (chunks.empty()) continue; 
+             auto parts = getPartitions(i);
+             
+             if (chunks.empty() && parts.empty()) continue;
 
              bool system = isSystemDisk(i);
              cout << "Disk " << i << (system ? " [SYSTEM/BOOT]" : "") << ":\n";
              
              if (system) {
-                 cout << "  (Protecting System Disk - Read Only logic recommended)\n";
+                 cout << "  (Careful: System Disk)\n";
+             }
+             
+             // List Partitions
+             if (!parts.empty()) {
+                 cout << "  Existing Partitions:\n";
+                 for (const auto& p : parts) {
+                     cout << "    [P" << p.index << "] " << (p.size/1024/1024) << " MB (" << p.type << ") " << p.name << (p.isSystem ? " [SYSTEM]" : "") << "\n";
+                 }
              }
 
-             for (size_t c = 0; c < chunks.size(); c++) {
-                 cout << "  [" << c << "] Start: " << (chunks[c].offset/1024/1024) << " MB, Length: " << (chunks[c].length/1024/1024) << " MB\n";
-                 if (!system && chunks[c].length > maxFree) { 
-                     maxFree = chunks[c].length;
-                     bestDisk = i;
+             // List Unallocated
+             if (!chunks.empty()) {
+                 cout << "  Unallocated Space:\n";
+                 for (size_t c = 0; c < chunks.size(); c++) {
+                     cout << "    [C" << c << "] Start: " << (chunks[c].offset/1024/1024) << " MB, Length: " << (chunks[c].length/1024/1024) << " MB\n";
+                     if (!system && chunks[c].length > maxFree) { 
+                         maxFree = chunks[c].length;
+                         bestDisk = i;
+                     }
                  }
              }
         }
@@ -356,8 +488,8 @@ public:
         
         if (isSystemDisk(diskIndex)) {
             string override;
-            cout << "WARNING: Disk " << diskIndex << " appears to be the SYSTEM DISK.\n";
-            cout << "Modifying it could render your OS unbootable.\n";
+            cout << "WARNING: Disk " << diskIndex << " is a SYSTEM DISK.\n";
+            cout << "Modifying partitions here is EXTREMELY DANGEROUS.\n";
             cout << "Type 'I UNDERSTAND' to proceed: ";
             cin >> override; 
             if (override != "I") return {0, 0, 0, false}; 
@@ -365,61 +497,79 @@ public:
         }
 
         auto chunks = getUnallocatedSpace(diskIndex);
-        if (chunks.empty()) { 
-             cout << "No unallocated space found on Disk " << diskIndex << ".\n";
-             if (isSystemDisk(diskIndex)) {
-                 cout << "This is a System Disk. Cannot wipe safely.\n";
-                 return {0, 0, 0, false};
-             }
+        auto parts = getPartitions(diskIndex);
+        
+        if (chunks.empty() && parts.empty()) {
+            cout << "Invalid disk index or no access.\n";
+            return {0, 0, 0, false};
+        }
+
+        cout << "Select target: 'P<num>' for partition (WIPE) or 'C<num>' for unallocated space (CREATE)\n";
+        cout << "Selection (e.g. P1 or C0): ";
+        string sel;
+        cin >> sel;
+        
+        // Handle Partition Selection (Reuse/Wipe)
+        if (toupper(sel[0]) == 'P') {
+            int pIdx = stoi(sel.substr(1));
+            // Find the partition helper
+            bool found = false;
+            PartitionInfo target;
+            for(auto& p : parts) {
+                if (p.index == pIdx) { target = p; found = true; break; }
+            }
+            if (!found) { cout << "Invalid partition index.\n"; return {0,0,0,false}; }
+            
+            if (target.isSystem) {
+                cout << "ERROR: Cannot format EFI/System partition.\n";
+                return {0,0,0,false};
+            }
+            
+            cout << "\n!!! WARNING: DATA LOSS IMMINENT !!!\n";
+            cout << "You are about to WIPE Partition " << pIdx << " on Disk " << diskIndex << "\n";
+            cout << "Size: " << (target.size/1024/1024) << " MB\n";
+            cout << "ALL DATA on this partition will be DESTROYED.\n";
+            cout << "Type 'WIPE' to confirm: ";
+            string confirm;
+            cin >> confirm;
+            if (confirm != "WIPE") return {0,0,0,false};
+            
+            char driveLetter;
+            cout << "Enter Drive Letter (e.g. Z): ";
+            cin >> driveLetter;
+            driveLetter = toupper(driveLetter);
+            
+            if (preparePartitionForUse(diskIndex, target.offset, target.size, driveLetter)) {
+                return {diskIndex, target.offset, target.size, true};
+            } else {
+                cout << "Failed to prepare partition.\n";
+                return {0,0,0,false};
+            }
+        }
+        // Handle Chunk Selection (Create)
+        else if (toupper(sel[0]) == 'C') {
+             int cIdx = stoi(sel.substr(1));
+             if (cIdx < 0 || cIdx >= (int)chunks.size()) { cout << "Invalid chunk.\n"; return {0,0,0,false}; }
              
-             cout << "Would you like to WIPE the disk and clear all partitions? (Required for new FS)\n";
-             cout << "Type 'WIPE' to confirm (ALL DATA WILL BE LOST): ";
-             string wipeConf;
-             cin >> wipeConf;
-             if (wipeConf == "WIPE") {
-                 cout << "Wiping Disk " << diskIndex << "...\n";
-                 if (clearDisk(diskIndex)) {
-                     cout << "Disk Wiped. Re-scanning...\n";
-                     Sleep(2000);
-                     chunks = getUnallocatedSpace(diskIndex);
-                     if (chunks.empty()) { cout << "Still no space? Try removing getting a new disk.\n"; return {0, 0, 0, false}; }
-                 } else {
-                     cout << "Failed to wipe disk.\n";
-                     return {0, 0, 0, false};
-                 }
-             } else {
-                 return {0, 0, 0, false};
+             uint64_t availMB = chunks[cIdx].length / 1024 / 1024;
+             uint64_t sizeMB;
+             cout << "Enter Size (MB) [Max " << availMB << "]: ";
+             cin >> sizeMB;
+             if (sizeMB > availMB) sizeMB = availMB;
+             
+             char driveLetter;
+             cout << "Enter Drive Letter (e.g. Z): ";
+             cin >> driveLetter;
+             driveLetter = toupper(driveLetter);
+             
+             uint64_t partOffset = chunks[cIdx].offset;
+             uint64_t partSize = sizeMB * 1024 * 1024;
+             
+             if (createPartition(diskIndex, partOffset, partSize, driveLetter)) {
+                 return {diskIndex, partOffset, partSize, true};
              }
         }
         
-        int chunkIndex;
-        cout << "Select Chunk Index: ";
-        cin >> chunkIndex;
-        if (chunkIndex < 0 || chunkIndex >= (int)chunks.size()) return {0, 0, 0, false};
-        
-        uint64_t availMB = chunks[chunkIndex].length / 1024 / 1024;
-        uint64_t sizeMB;
-        cout << "Enter Size (MB) [Max " << availMB << "]: ";
-        cin >> sizeMB;
-        if (sizeMB > availMB) sizeMB = availMB;
-        
-        char driveLetter;
-        cout << "Enter Drive Letter (e.g. Z): ";
-        cin >> driveLetter;
-        driveLetter = toupper(driveLetter);
-        
-        string confirm;
-        cout << "Type 'YES' to write changes to Disk " << diskIndex << ": ";
-        cin >> confirm;
-        transform(confirm.begin(), confirm.end(), confirm.begin(), ::toupper);
-        if (confirm != "YES") return {0, 0, 0, false};
-        
-        uint64_t partOffset = chunks[chunkIndex].offset;
-        uint64_t partSize = sizeMB * 1024 * 1024;
-        if (createPartition(diskIndex, partOffset, partSize, driveLetter)) {
-            PartitionResult result = {diskIndex, partOffset, partSize, true};
-            return result;
-        }
         return {0, 0, 0, false};
     }
 };
