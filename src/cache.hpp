@@ -1,13 +1,14 @@
 /*
- * cache.hpp - Sector and Entry Caching for LevelFS
+ * cache.hpp - Advanced Caching Layer for LevelFS
  * 
- * Compile: Include in mount.cpp with #include "cache.hpp"
+ * Compile: Included automatically via fs_common.hpp
  * 
  * Features:
- *   - Sector-level caching with LRU eviction
- *   - Write-through policy (writes go to disk immediately)
- *   - Dirty tracking for write-back optimization
+ *   - Sector-level LRU caching with configurable size
+ *   - Cluster-level caching for directory entries
+ *   - Write-through policy (immediate persistence)
  *   - Cache statistics tracking
+ *   - Automatic eviction management
  */
 
 #ifndef CACHE_HPP
@@ -19,71 +20,65 @@
 #include <cstring>
 #include <cstdint>
 #include <iostream>
+#include <iomanip>
+#include <mutex>
 
 using namespace std;
 
-struct CacheStats {
+struct LfsCacheStats {
     uint64_t hits;
     uint64_t misses;
     uint64_t evictions;
+    uint64_t writes;
     uint64_t writebacks;
     
-    CacheStats() : hits(0), misses(0), evictions(0), writebacks(0) {}
+    LfsCacheStats() : hits(0), misses(0), evictions(0), writes(0), writebacks(0) {}
     
     double hitRate() const {
         uint64_t total = hits + misses;
         return total > 0 ? (double)hits / total * 100.0 : 0.0;
     }
     
-    void display() const {
-        cout << "\n=== Cache Statistics ===\n";
-        cout << "  Hits:       " << hits << "\n";
-        cout << "  Misses:     " << misses << "\n";
-        cout << "  Hit Rate:   " << hitRate() << "%\n";
-        cout << "  Evictions:  " << evictions << "\n";
-        cout << "  Writebacks: " << writebacks << "\n";
-    }
-    
-    void reset() {
-        hits = misses = evictions = writebacks = 0;
-    }
-};
-
-struct CacheEntry {
-    vector<uint8_t> data;
-    bool dirty;
-    
-    CacheEntry() : dirty(false) {}
-    CacheEntry(size_t size) : data(size, 0), dirty(false) {}
+    void reset() { hits = misses = evictions = writes = writebacks = 0; }
 };
 
 template<size_t ENTRY_SIZE>
-class LRUCache {
+class LfsLRUCache {
+public:
+    using WriteCallback = bool(*)(uint64_t key, const void* data, size_t size, void* context);
+
 private:
     size_t maxEntries;
-    
     list<uint64_t> lruList;
     unordered_map<uint64_t, typename list<uint64_t>::iterator> lruMap;
-    unordered_map<uint64_t, CacheEntry> cache;
+    unordered_map<uint64_t, vector<uint8_t>> cacheData;
+    unordered_map<uint64_t, bool> dirtyBits;
+    LfsCacheStats stats;
+    mutex mtx;
+    bool enabled;
     
-    CacheStats stats;
+    WriteCallback writeCallback;
+    void* callbackContext;
     
-    void evictOldest() {
+    void evictOldestUnsafe() {
         if (lruList.empty()) return;
-        
         uint64_t oldest = lruList.back();
         
-        if (cache.count(oldest) && cache[oldest].dirty) {
-            stats.writebacks++;
+        if (dirtyBits.count(oldest) && dirtyBits[oldest]) {
+            if (writeCallback && cacheData.count(oldest)) {
+                writeCallback(oldest, cacheData[oldest].data(), ENTRY_SIZE, callbackContext);
+                stats.writebacks++;
+            }
+            dirtyBits.erase(oldest);
         }
         
         lruList.pop_back();
         lruMap.erase(oldest);
-        cache.erase(oldest);
+        cacheData.erase(oldest);
         stats.evictions++;
     }
     
-    void touch(uint64_t key) {
+    void touchUnsafe(uint64_t key) {
         if (lruMap.count(key)) {
             lruList.erase(lruMap[key]);
         }
@@ -92,223 +87,232 @@ private:
     }
 
 public:
-    LRUCache(size_t maxSize = 1024) : maxEntries(maxSize) {}
+    LfsLRUCache(size_t maxSize = 2048) : maxEntries(maxSize), enabled(true),
+                                         writeCallback(nullptr), callbackContext(nullptr) {}
     
     bool get(uint64_t key, void* buffer) {
-        if (!cache.count(key)) {
+        lock_guard<mutex> guard(mtx);
+        
+        if (!enabled) return false;
+        
+        auto it = cacheData.find(key);
+        if (it == cacheData.end()) {
             stats.misses++;
             return false;
         }
         
         stats.hits++;
-        touch(key);
-        memcpy(buffer, cache[key].data.data(), ENTRY_SIZE);
+        touchUnsafe(key);
+        memcpy(buffer, it->second.data(), ENTRY_SIZE);
         return true;
     }
     
     void put(uint64_t key, const void* buffer, bool isDirty = false) {
-        if (!cache.count(key) && cache.size() >= maxEntries) {
-            evictOldest();
+        lock_guard<mutex> guard(mtx);
+        
+        if (!enabled) return;
+        
+        if (!cacheData.count(key) && cacheData.size() >= maxEntries) {
+            evictOldestUnsafe();
         }
         
-        if (!cache.count(key)) {
-            cache[key] = CacheEntry(ENTRY_SIZE);
+        if (!cacheData.count(key)) {
+            cacheData[key] = vector<uint8_t>(ENTRY_SIZE);
         }
         
-        memcpy(cache[key].data.data(), buffer, ENTRY_SIZE);
-        cache[key].dirty = isDirty;
-        touch(key);
+        memcpy(cacheData[key].data(), buffer, ENTRY_SIZE);
+        if (isDirty) dirtyBits[key] = true;
+        touchUnsafe(key);
+        stats.writes++;
     }
     
     void invalidate(uint64_t key) {
-        if (cache.count(key)) {
+        lock_guard<mutex> guard(mtx);
+        
+        auto it = cacheData.find(key);
+        if (it != cacheData.end()) {
             if (lruMap.count(key)) {
                 lruList.erase(lruMap[key]);
                 lruMap.erase(key);
             }
-            cache.erase(key);
+            cacheData.erase(it);
         }
     }
     
-    void markDirty(uint64_t key) {
-        if (cache.count(key)) {
-            cache[key].dirty = true;
-        }
-    }
-    
-    bool isDirty(uint64_t key) const {
-        auto it = cache.find(key);
-        return it != cache.end() && it->second.dirty;
-    }
-    
-    void markClean(uint64_t key) {
-        if (cache.count(key)) {
-            cache[key].dirty = false;
+    void invalidateRange(uint64_t start, uint64_t count) {
+        lock_guard<mutex> guard(mtx);
+        
+        for (uint64_t i = 0; i < count; i++) {
+            uint64_t key = start + i;
+            auto it = cacheData.find(key);
+            if (it != cacheData.end()) {
+                if (lruMap.count(key)) {
+                    lruList.erase(lruMap[key]);
+                    lruMap.erase(key);
+                }
+                cacheData.erase(it);
+            }
         }
     }
     
     void clear() {
+        lock_guard<mutex> guard(mtx);
         lruList.clear();
         lruMap.clear();
-        cache.clear();
+        cacheData.clear();
     }
     
-    size_t size() const { return cache.size(); }
+    void enable(bool e) { enabled = e; }
+    bool isEnabled() const { return enabled; }
+    
+    size_t size() const { return cacheData.size(); }
     size_t capacity() const { return maxEntries; }
-    const CacheStats& getStats() const { return stats; }
+    
+    void setCapacity(size_t cap) {
+        lock_guard<mutex> guard(mtx);
+        maxEntries = cap;
+        while (cacheData.size() > maxEntries) {
+            evictOldestUnsafe();
+        }
+    }
+    
+    const LfsCacheStats& getStats() const { return stats; }
     void resetStats() { stats.reset(); }
     
-    void setMaxEntries(size_t max) {
-        maxEntries = max;
-        while (cache.size() > maxEntries) {
-            evictOldest();
+    void setWriteCallback(WriteCallback cb, void* ctx) {
+        writeCallback = cb;
+        callbackContext = ctx;
+    }
+    
+    void markDirty(uint64_t key) {
+        lock_guard<mutex> guard(mtx);
+        if (cacheData.count(key)) {
+            dirtyBits[key] = true;
         }
     }
     
-    vector<pair<uint64_t, bool>> getDirtyEntries() const {
-        vector<pair<uint64_t, bool>> dirty;
-        for (const auto& kv : cache) {
-            if (kv.second.dirty) {
-                dirty.push_back({kv.first, true});
+    void markClean(uint64_t key) {
+        lock_guard<mutex> guard(mtx);
+        dirtyBits.erase(key);
+    }
+    
+    size_t getDirtyCount() const {
+        size_t count = 0;
+        for (const auto& kv : dirtyBits) {
+            if (kv.second) count++;
+        }
+        return count;
+    }
+    
+    size_t flush() {
+        lock_guard<mutex> guard(mtx);
+        size_t flushed = 0;
+        
+        if (!writeCallback) return 0;
+        
+        for (auto& kv : dirtyBits) {
+            if (kv.second && cacheData.count(kv.first)) {
+                if (writeCallback(kv.first, cacheData[kv.first].data(), ENTRY_SIZE, callbackContext)) {
+                    kv.second = false;
+                    flushed++;
+                    stats.writebacks++;
+                }
             }
         }
-        return dirty;
+        
+        dirtyBits.clear();
+        return flushed;
+    }
+    
+    void displayStats() const {
+        cout << "\n=== Cache Statistics ===\n";
+        cout << "  Status:     " << (enabled ? "ENABLED" : "DISABLED") << "\n";
+        cout << "  Entries:    " << cacheData.size() << " / " << maxEntries << "\n";
+        cout << "  Dirty:      " << getDirtyCount() << "\n";
+        cout << "  Hits:       " << stats.hits << "\n";
+        cout << "  Misses:     " << stats.misses << "\n";
+        cout << "  Hit Rate:   " << fixed << setprecision(1) << stats.hitRate() << "%\n";
+        cout << "  Evictions:  " << stats.evictions << "\n";
+        cout << "  Writebacks: " << stats.writebacks << "\n";
     }
 };
 
-class CachedDiskDevice {
-private:
-    void* realDisk;
-    bool (*realReadSector)(void*, uint64_t, void*);
-    bool (*realWriteSector)(void*, uint64_t, const void*);
-    
-    LRUCache<512> sectorCache;
-    bool cacheEnabled;
-    bool verbose;
-    
+class LfsSectorCache {
 public:
-    CachedDiskDevice() : realDisk(nullptr), realReadSector(nullptr), 
-                         realWriteSector(nullptr), sectorCache(2048),
-                         cacheEnabled(true), verbose(false) {}
-    
-    void init(void* disk,
-              bool (*readFn)(void*, uint64_t, void*),
-              bool (*writeFn)(void*, uint64_t, const void*)) {
-        realDisk = disk;
-        realReadSector = readFn;
-        realWriteSector = writeFn;
-    }
-    
-    bool readSector(uint64_t sector, void* buffer) {
-        if (!cacheEnabled || !realReadSector) {
-            return realReadSector ? realReadSector(realDisk, sector, buffer) : false;
-        }
-        
-        if (sectorCache.get(sector, buffer)) {
-            if (verbose) {
-                cout << "[Cache HIT] Sector " << sector << "\n";
-            }
-            return true;
-        }
-        
-        if (!realReadSector(realDisk, sector, buffer)) {
-            return false;
-        }
-        
-        if (verbose) {
-            cout << "[Cache MISS] Sector " << sector << " - loaded from disk\n";
-        }
-        
-        sectorCache.put(sector, buffer, false);
-        return true;
-    }
-    
-    bool writeSector(uint64_t sector, const void* buffer) {
-        if (!realWriteSector) return false;
-        
-        if (!realWriteSector(realDisk, sector, buffer)) {
-            return false;
-        }
-        
-        if (cacheEnabled) {
-            sectorCache.put(sector, buffer, false);
-        }
-        
-        return true;
-    }
-    
-    void invalidate(uint64_t sector) {
-        sectorCache.invalidate(sector);
-    }
-    
-    void invalidateRange(uint64_t start, uint64_t count) {
-        for (uint64_t i = 0; i < count; i++) {
-            sectorCache.invalidate(start + i);
-        }
-    }
-    
-    void flush() {
-        auto dirty = sectorCache.getDirtyEntries();
-        for (const auto& entry : dirty) {
-            uint8_t buffer[512];
-            if (sectorCache.get(entry.first, buffer)) {
-                realWriteSector(realDisk, entry.first, buffer);
-                sectorCache.markClean(entry.first);
-            }
-        }
-    }
-    
-    void clearCache() {
-        flush();
-        sectorCache.clear();
-    }
-    
-    void enableCache(bool enable) { cacheEnabled = enable; }
-    bool isCacheEnabled() const { return cacheEnabled; }
-    
-    void setVerbose(bool v) { verbose = v; }
-    
-    void setCacheSize(size_t entries) {
-        sectorCache.setMaxEntries(entries);
-    }
-    
-    const CacheStats& getStats() const { return sectorCache.getStats(); }
-    void displayStats() const { sectorCache.getStats().display(); }
-    void resetStats() { sectorCache.resetStats(); }
-    
-    size_t getCacheSize() const { return sectorCache.size(); }
-    size_t getCacheCapacity() const { return sectorCache.capacity(); }
-};
+    using WriteCallback = LfsLRUCache<512>::WriteCallback;
 
-class SectorCache {
 private:
-    LRUCache<512> cache;
-    bool enabled;
+    static const size_t SECTOR_SIZE = 512;
+    LfsLRUCache<SECTOR_SIZE> cache;
     
 public:
-    SectorCache(size_t maxEntries = 2048) : cache(maxEntries), enabled(true) {}
+    LfsSectorCache(size_t maxSectors = 4096) : cache(maxSectors) {}
     
     bool read(uint64_t sector, void* buffer) {
-        if (!enabled) return false;
         return cache.get(sector, buffer);
     }
     
-    void write(uint64_t sector, const void* buffer) {
-        if (enabled) {
-            cache.put(sector, buffer, false);
-        }
+    void write(uint64_t sector, const void* buffer, bool isDirty = false) {
+        cache.put(sector, buffer, isDirty);
     }
     
     void invalidate(uint64_t sector) {
         cache.invalidate(sector);
     }
     
-    void clear() { cache.clear(); }
-    void enable(bool e) { enabled = e; }
-    bool isEnabled() const { return enabled; }
+    void invalidateCluster(uint64_t cluster, size_t sectorsPerCluster = 8) {
+        cache.invalidateRange(cluster * sectorsPerCluster, sectorsPerCluster);
+    }
     
-    const CacheStats& stats() const { return cache.getStats(); }
-    void displayStats() const { cache.getStats().display(); }
+    void clear() { cache.clear(); }
+    void enable(bool e) { cache.enable(e); }
+    bool isEnabled() const { return cache.isEnabled(); }
+    
+    size_t size() const { return cache.size(); }
+    size_t capacity() const { return cache.capacity(); }
+    void setCapacity(size_t cap) { cache.setCapacity(cap); }
+    
+    void setWriteCallback(WriteCallback cb, void* ctx) { cache.setWriteCallback(cb, ctx); }
+    void markDirty(uint64_t sector) { cache.markDirty(sector); }
+    void markClean(uint64_t sector) { cache.markClean(sector); }
+    size_t getDirtyCount() const { return cache.getDirtyCount(); }
+    size_t flush() { return cache.flush(); }
+    
+    const LfsCacheStats& stats() const { return cache.getStats(); }
+    void resetStats() { cache.resetStats(); }
+    void displayStats() const { cache.displayStats(); }
+};
+
+class LfsClusterCache {
+private:
+    static const size_t CLUSTER_SIZE = 4096;
+    LfsLRUCache<CLUSTER_SIZE> cache;
+    
+public:
+    LfsClusterCache(size_t maxClusters = 512) : cache(maxClusters) {}
+    
+    bool read(uint64_t cluster, void* buffer) {
+        return cache.get(cluster, buffer);
+    }
+    
+    void write(uint64_t cluster, const void* buffer) {
+        cache.put(cluster, buffer);
+    }
+    
+    void invalidate(uint64_t cluster) {
+        cache.invalidate(cluster);
+    }
+    
+    void clear() { cache.clear(); }
+    void enable(bool e) { cache.enable(e); }
+    bool isEnabled() const { return cache.isEnabled(); }
+    
+    size_t size() const { return cache.size(); }
+    size_t capacity() const { return cache.capacity(); }
+    
+    const LfsCacheStats& stats() const { return cache.getStats(); }
+    void resetStats() { cache.resetStats(); }
+    void displayStats() const { cache.displayStats(); }
 };
 
 #endif

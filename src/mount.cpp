@@ -10,6 +10,7 @@
 #include "fs_context.hpp"
 #include "defrag.hpp"
 #include "concurrent.hpp"
+#include "lstream.hpp"
 
 class FileSystemShell {
     DiskDevice disk;
@@ -98,29 +99,29 @@ public:
         if (hTest == INVALID_HANDLE_VALUE) {
             DWORD err = GetLastError();
             if (err == ERROR_FILE_NOT_FOUND || err == ERROR_PATH_NOT_FOUND) {
-                cout << "Disk/Partition " << driveLetter << ": doesn't exist.\n";
+                lout << "Disk/Partition " << driveLetter << ": doesn't exist.\n";
             } else if (err == ERROR_ACCESS_DENIED) {
-                cout << "Disk/Partition " << driveLetter << ": can't be accessed.\n";
+                lout << "Disk/Partition " << driveLetter << ": can't be accessed.\n";
             } else {
-                cout << "Disk/Partition " << driveLetter << ": can't be accessed. (Error " << err << ")\n";
+                lout << "Disk/Partition " << driveLetter << ": can't be accessed. (Error " << err << ")\n";
             }
             return false;
         }
         CloseHandle(hTest);
         
         if (!disk.open(driveLetter)) {
-            cout << "Disk/Partition " << driveLetter << ": can't be accessed.\n";
+            lout << "Disk/Partition " << driveLetter << ": can't be accessed.\n";
             return false;
         }
         
         if (!disk.readSector(0, &sb)) {
-            cout << "Disk/Partition " << driveLetter << ": can't be accessed.\n";
+            lout << "Disk/Partition " << driveLetter << ": can't be accessed.\n";
             disk.close();
             return false;
         }
         if (sb.magic != MAGIC) {
             if (!tryBackupSuperblock()) {
-                cout << "Disk/Partition " << driveLetter << ": is not a LeveledFS.\n";
+                lout << "Disk/Partition " << driveLetter << ": is not a LeveledFS.\n";
                 disk.close();
                 return false;
             }
@@ -142,21 +143,21 @@ public:
         entryFinder = new EntryFinder(disk);
         permCache.clear();
         
-        cout << "Mounted successfully. At Root.\n";
+        lout << "Mounted successfully. At Root.\n";
         
         if(loadVersion("master")) {
-            cout << "Context: master (Level ID: " << context.currentLevelID << ")\n";
+            lout << "Context: master (Level ID: " << context.currentLevelID << ")\n";
             context.rootContentCluster = context.currentContentCluster;
             context.rootVersion = "master";
         } else {
-            cout << "No master version.\n";
+            lout << "No master version.\n";
             context.rootContentCluster = 0;
         }
         return true;
     }
     
     bool mountAuto() {
-        cout << "Scanning for LevelFS volumes...\n";
+        lout << "Scanning for LevelFS volumes...\n";
         
         for (char letter = 'A'; letter <= 'Z'; letter++) {
             if (letter == 'C') continue;
@@ -172,31 +173,31 @@ public:
             
             if (testSb.magic == MAGIC) {
                 testDisk.close();
-                cout << "Found LevelFS volume on " << letter << ":\n";
+                lout << "Found LevelFS volume on " << letter << ":\n";
                 return mount(letter);
             }
             
             testDisk.close();
         }
         
-        cout << "No LevelFS disk found.\n";
+        lout << "No LevelFS disk found.\n";
         return false;
     }
 
     bool mountImage(const string& path) {
         if (!disk.openFile(path)) {
-            cout << "Failed to open image file: " << path << "\n";
+            lout << "Failed to open image file: " << path << "\n";
             return false;
         }
         
         if (!disk.readSector(0, &sb)) {
-            cout << "Failed to read superblock.\n";
+            lout << "Failed to read superblock.\n";
             disk.close();
             return false;
         }
         if (sb.magic != MAGIC) {
             if (!tryBackupSuperblock()) {
-                cout << "Invalid magic: " << hex << sb.magic << dec << "\n";
+                lout << "Invalid magic: " << hex << sb.magic << dec << "\n";
                 disk.close();
                 return false;
             }
@@ -218,19 +219,19 @@ public:
         entryFinder = new EntryFinder(disk);
         permCache.clear();
         
-        cout << "=== Leveled File System v2 ===\n";
-        cout << "  Image: " << path << " (" << (disk.getDiskSize()/1024/1024) << " MB)\n";
+        lout << "=== Leveled File System v2 ===\n";
+        lout << "  Image: " << path << " (" << (disk.getDiskSize()/1024/1024) << " MB)\n";
         
         if (sb.levelRegistryCluster != 0) {
-            cout << "  Level Registry: Cluster " << sb.levelRegistryCluster << "\n";
-            cout << "  Total Levels: " << sb.totalLevels << "\n";
+            lout << "  Level Registry: Cluster " << sb.levelRegistryCluster << "\n";
+            lout << "  Total Levels: " << sb.totalLevels << "\n";
         }
         
         if(loadVersion("master")) {
-            cout << "  Active Level: master (ID: " << context.currentLevelID << ")\n";
+            lout << "  Active Level: master (ID: " << context.currentLevelID << ")\n";
             context.rootContentCluster = context.currentContentCluster;
         } else {
-        cout << "No master version found. Creating...\n";
+        lout << "No master version found. Creating...\n";
         char vpsBuf[SECTOR_SIZE];
         VersionEntry* vps = (VersionEntry*)vpsBuf;
         memset(vpsBuf, 0, SECTOR_SIZE);
@@ -519,7 +520,7 @@ public:
         if (!disk.readSector(sb.backupSBCluster * 8, &backupSB)) return false;
         if (backupSB.magic != MAGIC) return false;
         
-        cout << "[Recovery] Primary SuperBlock corrupt. Using backup from cluster " << sb.backupSBCluster << "\n";
+        lout << "[Recovery] Primary SuperBlock corrupt. Using backup from cluster " << sb.backupSBCluster << "\n";
         sb = backupSB;
         // Restore primary from backup
         disk.writeSector(0, &sb);
@@ -648,7 +649,7 @@ public:
         
         // Check if current folder allows read (when looking at current dir)
         if (target.empty() && !(context.currentFolderPerms & PERM_READ)) {
-            cout << "Permission denied: no read access to current folder.\n";
+            lout << "Permission denied: no read access to current folder.\n";
             return;
         }
         
@@ -658,7 +659,7 @@ public:
         if (!target.empty()) {
             PathResult res = resolvePath(target);
             if (!res.valid) {
-                 cout << "Path not found.\n";
+                 lout << "Path not found.\n";
                  return;
             }
             string folderName = res.name;
@@ -694,21 +695,21 @@ public:
              }
 
              
-             if (!found) { cout << "Target not found.\n"; return; }
+             if (!found) { lout << "Target not found.\n"; return; }
              
              if (foundType == TYPE_FILE) {
-                 cout << "File: " << folderName << "\n";
+                 lout << "File: " << folderName << "\n";
                  return; 
              }
              
              if (levelName.empty()) {
-                  cout << "Levels of " << folderName << ":\n";
+                  lout << "Levels of " << folderName << ":\n";
                   char vpsBuf[SECTOR_SIZE];
                   VersionEntry* vps = (VersionEntry*)vpsBuf;
                   for (int i=0; i<8; i++) {
                       disk.readSector(foundCluster * 8 + i, vpsBuf);
                       for (int j=0; j<SECTOR_SIZE/sizeof(VersionEntry); j++) {
-                          if (vps[j].isActive) cout << " [" << vps[j].versionName << "]\n";
+                          if (vps[j].isActive) lout << " [" << vps[j].versionName << "]\n";
                       }
                   }
                   return;
@@ -728,11 +729,11 @@ public:
                      }
                      if (lvlFound) break;
                  }
-                 if (!lvlFound) { cout << "Level '" << levelName << "' not found.\n"; return; }
+                 if (!lvlFound) { lout << "Level '" << levelName << "' not found.\n"; return; }
              }
         }
         
-        cout << "Content of " << itemsTitle << ":\n";
+        lout << "Content of " << itemsTitle << ":\n";
         DirEntry entries[SECTOR_SIZE/sizeof(DirEntry)];
         bool empty = true;
         
@@ -762,7 +763,7 @@ public:
                             displayName += entries[j].extension;
                         }
                         
-                        cout << setw(8) << left << typeStr << " " << displayName;
+                        lout << setw(8) << left << typeStr << " " << displayName;
                         
                         if (entries[j].type == TYPE_SYMLINK && entries[j].startCluster != 0) {
                             char targetBuf[CLUSTER_SIZE];
@@ -770,20 +771,20 @@ public:
                             for (int s=0; s<8; s++) {
                                 disk.readSector(entries[j].startCluster * 8 + s, targetBuf + (s * SECTOR_SIZE));
                             }
-                            cout << " -> " << targetBuf;
+                            lout << " -> " << targetBuf;
                         }
                         if (entries[j].type == TYPE_LEVEL_MOUNT) {
                             LevelDescriptor* lvl = findLevelByID(entries[j].startCluster);
-                            if (lvl) cout << " -> Level '" << lvl->name << "' (ID: " << entries[j].startCluster << ")";
-                            else cout << " -> Level ID: " << entries[j].startCluster;
+                            if (lvl) lout << " -> Level '" << lvl->name << "' (ID: " << entries[j].startCluster << ")";
+                            else lout << " -> Level ID: " << entries[j].startCluster;
                         }
-                        cout << "\n";
+                        lout << "\n";
                     }
                 }
             }
         }
-        if (empty) cout << "(empty)\n";
-        cout.flush();
+        if (empty) lout << "(empty)\n";
+        lout.flush();
     }
 
     void lookTarget(string target) {
@@ -812,12 +813,12 @@ public:
         }
         
         if (!folderCluster) {
-            cout << "Folder '" << folderName << "' not found.\n";
+            lout << "Folder '" << folderName << "' not found.\n";
             return;
         }
         
         if (levelName.empty()) {
-            cout << "Levels of '" << folderName << "':\n";
+            lout << "Levels of '" << folderName << "':\n";
             char vpsBuf[SECTOR_SIZE];
             VersionEntry* vps = (VersionEntry*)vpsBuf;
             int count = 0;
@@ -825,12 +826,12 @@ public:
                 disk.readSector(folderCluster * 8 + i, vpsBuf);
                 for (int j=0; j<SECTOR_SIZE/sizeof(VersionEntry); j++) {
                     if (vps[j].isActive) {
-                        cout << "  [" << vps[j].versionName << "]\n";
+                        lout << "  [" << vps[j].versionName << "]\n";
                         count++;
                     }
                 }
             }
-            if (count == 0) cout << "  (no levels)\n";
+            if (count == 0) lout << "  (no levels)\n";
         } else {
             char vpsBuf[SECTOR_SIZE];
             VersionEntry* vps = (VersionEntry*)vpsBuf;
@@ -847,11 +848,11 @@ public:
             }
             
             if (!contentCluster) {
-                cout << "Level '" << levelName << "' not found in '" << folderName << "'.\n";
+                lout << "Level '" << levelName << "' not found in '" << folderName << "'.\n";
                 return;
             }
             
-            cout << "Content of " << folderName << ":" << levelName << ":\n";
+            lout << "Content of " << folderName << ":" << levelName << ":\n";
             bool empty = true;
             for (int i=0; i<8; i++) {
                 memset(entries, 0, sizeof(entries));
@@ -861,13 +862,13 @@ public:
                         empty = false;
                         entries[j].name[31] = '\0';
                         string typeStr = (entries[j].type == TYPE_LEVELED_DIR) ? "<L-DIR>" : "<FILE>";
-                        cout << setw(8) << left << typeStr << " " << entries[j].name << "\n";
+                        lout << setw(8) << left << typeStr << " " << entries[j].name << "\n";
                     }
                 }
             }
-            if (empty) cout << "(empty)\n";
+            if (empty) lout << "(empty)\n";
         }
-        cout.flush();
+        lout.flush();
     }
 
     void dirTreeRecurse(uint64_t contentCluster, string prefix, bool isLast) {
@@ -899,12 +900,12 @@ public:
         
         for (size_t i = 0; i < files.size(); i++) {
             bool last = (i == files.size() - 1) && folders.empty();
-            cout << prefix << (last ? "└── " : "├── ") << files[i] << "\n";
+            lout << prefix << (last ? "└── " : "├── ") << files[i] << "\n";
         }
         
         for (size_t i = 0; i < folders.size(); i++) {
             bool last = (i == folders.size() - 1);
-            cout << prefix << (last ? "└── " : "├── ") << "[" << folders[i].first << "]" << "\n";
+            lout << prefix << (last ? "└── " : "├── ") << "[" << folders[i].first << "]" << "\n";
             
             char vpsBuf[SECTOR_SIZE];
             for (int s=0; s<8; s++) {
@@ -927,7 +928,7 @@ public:
                                 }
                             }
                         }
-                        cout << newPrefix << (lastLevel ? "└── " : "├── ") << ":" << vps[j].versionName << "\n";
+                        lout << newPrefix << (lastLevel ? "└── " : "├── ") << ":" << vps[j].versionName << "\n";
                         dirTreeRecurse(vps[j].contentTableCluster, newPrefix + (lastLevel ? "    " : "│   "), lastLevel);
                     }
                 }
@@ -952,7 +953,7 @@ public:
         }
         
         if (rootLevels.empty()) {
-            cout << "No root levels found.\n";
+            lout << "No root levels found.\n";
             return;
         }
         
@@ -963,9 +964,9 @@ public:
             selectedLevel = rootLevels[0].first;
             selectedCluster = rootLevels[0].second;
         } else {
-            cout << "Root levels available: ";
-            for (const auto& lv : rootLevels) cout << "[" << lv.first << "] ";
-            cout << "\nSelect level for tree: ";
+            lout << "Root levels available: ";
+            for (const auto& lv : rootLevels) lout << "[" << lv.first << "] ";
+            lout << "\nSelect level for tree: ";
             cin >> selectedLevel;
             cin.ignore(1000, '\n');
             
@@ -978,31 +979,31 @@ public:
                 }
             }
             if (!found) {
-                cout << "Level '" << selectedLevel << "' not found.\n";
+                lout << "Level '" << selectedLevel << "' not found.\n";
                 return;
             }
         }
         
-        cout << "/" << " (" << selectedLevel << ")\n";
+        lout << "/" << " (" << selectedLevel << ")\n";
         dirTreeRecurse(selectedCluster, "", true);
-        cout.flush();
+        lout.flush();
     }
 
     void createSymlink(string linkPath, string targetPath) {
         if (!disk.isOpen()) return;
         
         if (linkPath.find(':') != string::npos) {
-            cout << "Cannot create symlink inside a level. Use a folder path.\n";
+            lout << "Cannot create symlink inside a level. Use a folder path.\n";
             return;
         }
         
         if (!(context.currentFolderPerms & PERM_WRITE)) {
-            cout << "Permission denied: current folder is read-only.\n";
+            lout << "Permission denied: current folder is read-only.\n";
             return;
         }
         
         PathResult res = resolvePath(linkPath);
-        if (!res.valid) { cout << "Invalid link path.\n"; return; }
+        if (!res.valid) { lout << "Invalid link path.\n"; return; }
         
         createInCluster(res.parentCluster, "symlink", res.name);
         
@@ -1017,7 +1018,7 @@ public:
                         // Allocate cluster to store target path
                         uint64_t targetCluster = allocCluster();
                         if (targetCluster == 0) {
-                            cout << "Disk full. Cannot create symlink.\n";
+                            lout << "Disk full. Cannot create symlink.\n";
                             entries[j].type = TYPE_FREE;
                             disk.writeSector(c * 8 + i, entries);
                             return;
@@ -1034,7 +1035,7 @@ public:
                         entries[j].startCluster = targetCluster;
                         entries[j].size = targetPath.length();
                         disk.writeSector(c * 8 + i, entries);
-                        cout << "Symlink '" << res.name << "' -> '" << targetPath << "' created.\n";
+                        lout << "Symlink '" << res.name << "' -> '" << targetPath << "' created.\n";
                         return;
                     }
                 }
@@ -1046,17 +1047,17 @@ public:
         if (!disk.isOpen()) return;
         
         if (linkPath.find(':') != string::npos || targetPath.find(':') != string::npos) {
-            cout << "Cannot create hardlink with level paths.\n";
+            lout << "Cannot create hardlink with level paths.\n";
             return;
         }
         
         if (!(context.currentFolderPerms & PERM_WRITE)) {
-            cout << "Permission denied: current folder is read-only.\n";
+            lout << "Permission denied: current folder is read-only.\n";
             return;
         }
         
         PathResult targetRes = resolvePath(targetPath);
-        if (!targetRes.valid) { cout << "Target file not found.\n"; return; }
+        if (!targetRes.valid) { lout << "Target file not found.\n"; return; }
         
         // Find target file entry
         DirEntry targetEntry;
@@ -1080,11 +1081,11 @@ public:
             }
         }
 found_target:
-        if (!found) { cout << "Target must be a regular file.\n"; return; }
+        if (!found) { lout << "Target must be a regular file.\n"; return; }
         
         // Create hardlink entry
         PathResult linkRes = resolvePath(linkPath);
-        if (!linkRes.valid) { cout << "Invalid link path.\n"; return; }
+        if (!linkRes.valid) { lout << "Invalid link path.\n"; return; }
         
         createInCluster(linkRes.parentCluster, "hardlink", linkRes.name);
         
@@ -1100,7 +1101,7 @@ found_target:
                         entries[j].size = targetEntry.size;
                         entries[j].attributes = targetEntry.attributes;  // Share refcount
                         disk.writeSector(c * 8 + i, entries);
-                        cout << "Hardlink '" << linkRes.name << "' -> '" << targetPath << "' created.\n";
+                        lout << "Hardlink '" << linkRes.name << "' -> '" << targetPath << "' created.\n";
                         return;
                     }
                 }
@@ -1113,12 +1114,12 @@ found_target:
         
         // Check if current folder allows write
         if (!(context.currentFolderPerms & PERM_WRITE)) {
-            cout << "Permission denied: current folder is read-only.\n";
+            lout << "Permission denied: current folder is read-only.\n";
             return;
         }
         
         PathResult res = resolvePath(path);
-        if (!res.valid) { cout << "Invalid path location.\n"; return; }
+        if (!res.valid) { lout << "Invalid path location.\n"; return; }
         
         createInCluster(res.parentCluster, type, res.name, extension);
     }
@@ -1132,7 +1133,7 @@ found_target:
         vector<uint64_t> chain = getChain(contentCluster);
         
         if (chain.empty()) {
-            cout << "Error: Invalid directory cluster. Cannot create.\n";
+            lout << "Error: Invalid directory cluster. Cannot create.\n";
             return;
         }
         
@@ -1158,7 +1159,7 @@ found_slot:
             uint64_t lastCluster = chain.back();
             uint64_t newCluster = allocCluster();
             if (newCluster == 0) {
-                cout << "Disk full. Cannot create " << type << ".\n";
+                lout << "Disk full. Cannot create " << type << ".\n";
                 return;
             }
             
@@ -1189,7 +1190,7 @@ found_slot:
             target->type = TYPE_LEVELED_DIR;
             target->startCluster = allocCluster();
             if (target->startCluster == 0) {
-                cout << "Disk full. Cannot create folder version table.\n";
+                lout << "Disk full. Cannot create folder version table.\n";
                 target->type = TYPE_FREE; // Mark entry as free again
                 disk.writeSector(targetCluster * 8 + freeSector, entries); // Write back to disk
                 return;
@@ -1204,7 +1205,7 @@ found_slot:
                 vTable[0].isActive = 1;
                 vTable[0].contentTableCluster = allocCluster();
                 if (vTable[0].contentTableCluster == 0) {
-                    cout << "Disk full. Cannot create folder content table.\n";
+                    lout << "Disk full. Cannot create folder content table.\n";
                     // Need to free previously allocated cluster for version table
                     setLATEntry(target->startCluster, LAT_FREE);
                     target->type = TYPE_FREE; // Mark entry as free again
@@ -1246,7 +1247,7 @@ found_slot:
             target->type = TYPE_FILE;
             target->startCluster = allocCluster();
             if (target->startCluster == 0) {
-                cout << "Disk full. Cannot create file content.\n";
+                lout << "Disk full. Cannot create file content.\n";
                 target->type = TYPE_FREE; // Mark entry as free again
                 disk.writeSector(targetCluster * 8 + freeSector, entries); // Write back to disk
                 return;
@@ -1259,7 +1260,7 @@ found_slot:
         
         string displayName = name;
         if (!extension.empty()) displayName += "." + extension;
-        cout << "Created " << type << " " << displayName << " [" << getPermsStr(target->attributes) << "]\n";
+        lout << "Created " << type << " " << displayName << " [" << getPermsStr(target->attributes) << "]\n";
     }
     
     string getPermsStr(uint32_t attrs) {
@@ -1306,7 +1307,7 @@ found_slot:
     void setLevelPerms(string options, string folderName, string levelName) {
         uint64_t folderCluster = findFolderCluster(folderName);
         if (folderCluster == 0) {
-            cout << "Folder '" << folderName << "' not found.\n";
+            lout << "Folder '" << folderName << "' not found.\n";
             return;
         }
         
@@ -1323,18 +1324,18 @@ found_slot:
                     else if (options == "-w") vps[j].permissions &= ~PERM_WRITE;
                     else if (options == "+x") vps[j].permissions |= PERM_EXEC;
                     else if (options == "-x") vps[j].permissions &= ~PERM_EXEC;
-                    else { cout << "Invalid option. Use +r,-r,+w,-w,+x,-x\n"; return; }
+                    else { lout << "Invalid option. Use +r,-r,+w,-w,+x,-x\n"; return; }
                     
                     vps[j].modTime = time(0);
                     disk.writeSector(folderCluster * 8 + s, vpsBuf);
                     permCache.clear();
-                    cout << "Level '" << levelName << "' permissions: " 
+                    lout << "Level '" << levelName << "' permissions: " 
                          << PermissionChecker::getPermsString(vps[j].permissions) << "\n";
                     return;
                 }
             }
         }
-        cout << "Level '" << levelName << "' not found in '" << folderName << "'.\n";
+        lout << "Level '" << levelName << "' not found in '" << folderName << "'.\n";
     }
     
     void perms(string options, string path) {
@@ -1349,7 +1350,7 @@ found_slot:
         }
         
         PathResult res = resolvePath(path);
-        if (!res.valid) { cout << "Item not found.\n"; return; }
+        if (!res.valid) { lout << "Item not found.\n"; return; }
         
         DirEntry entries[SECTOR_SIZE/sizeof(DirEntry)];
         vector<uint64_t> chain = getChain(res.parentCluster);
@@ -1366,18 +1367,18 @@ found_slot:
                         else if (options == "-w") entries[j].attributes &= ~PERM_WRITE;
                         else if (options == "+x") entries[j].attributes |= PERM_EXEC;
                         else if (options == "-x") entries[j].attributes &= ~PERM_EXEC;
-                        else { cout << "Invalid option. Use +r,-r,+w,-w,+x,-x\n"; return; }
+                        else { lout << "Invalid option. Use +r,-r,+w,-w,+x,-x\n"; return; }
                         
                         entries[j].modTime = time(0);
                         disk.writeSector(c * 8 + i, entries);
                         permCache.clear();
-                        cout << "Permissions: " << PermissionChecker::getPermsString(entries[j].attributes) << "\n";
+                        lout << "Permissions: " << PermissionChecker::getPermsString(entries[j].attributes) << "\n";
                         return;
                     }
                 }
             }
         }
-        cout << "File not found.\n";
+        lout << "File not found.\n";
     }
     
     void lookDetailed(string path = "") {
@@ -1388,7 +1389,7 @@ found_slot:
         
         if (!path.empty()) {
             PathResult res = resolvePath(path);
-            if (!res.valid) { cout << "Invalid path.\n"; return; }
+            if (!res.valid) { lout << "Invalid path.\n"; return; }
             
             // Find the folder
             DirEntry entries[SECTOR_SIZE/sizeof(DirEntry)];
@@ -1413,26 +1414,26 @@ found_slot:
                     }
                 }
             }
-            cout << "Folder not found.\n";
+            lout << "Folder not found.\n";
             return;
         }
         
 found:
-        cout << "\n" << title << " (detailed):\n";
-        cout << string(70, '-') << "\n";
-        cout << setw(8) << left << "Type" << " " << setw(5) << "Perms" << " " 
+        lout << "\n" << title << " (detailed):\n";
+        lout << string(70, '-') << "\n";
+        lout << setw(8) << left << "Type" << " " << setw(5) << "Perms" << " " 
              << setw(10) << right << "Size" << "  " << setw(16) << left << "Modified" << "  Name\n";
-        cout << string(70, '-') << "\n";
+        lout << string(70, '-') << "\n";
         
         string permsStr = getPermsStr(context.currentFolderPerms);
         string nowStr = formatTime((uint32_t)time(nullptr));
         
-        cout << setw(8) << left << "<DIR>" << " " 
+        lout << setw(8) << left << "<DIR>" << " " 
              << setw(5) << permsStr << " "
              << setw(10) << right << "-" << "  "
              << setw(16) << left << nowStr << "  .\n";
         
-        cout << setw(8) << left << "<DIR>" << " " 
+        lout << setw(8) << left << "<DIR>" << " " 
              << setw(5) << "rwx" << " "
              << setw(10) << right << "-" << "  "
              << setw(16) << left << nowStr << "  ..\n";
@@ -1468,7 +1469,7 @@ found:
                         string sizeStr = (entries[j].type == TYPE_FILE) ? to_string(entries[j].size) : "-";
                         string modStr = formatTime(entries[j].modTime);
                         
-                        cout << setw(8) << left << typeStr << " " 
+                        lout << setw(8) << left << typeStr << " " 
                              << setw(5) << perms << " "
                              << setw(10) << right << sizeStr << "  "
                              << setw(16) << left << modStr << "  " 
@@ -1477,54 +1478,54 @@ found:
                 }
             }
         }
-        if (empty) cout << "(empty)\n";
-        cout << string(70, '-') << "\n";
+        if (empty) lout << "(empty)\n";
+        lout << string(70, '-') << "\n";
     }
     
     // Filesystem check - validates integrity
     void fsck() {
         if (!disk.isOpen()) return;
         
-        cout << "\n=== LevelFS Filesystem Check ===\n\n";
+        lout << "\n=== LevelFS Filesystem Check ===\n\n";
         
         int errors = 0;
         int warnings = 0;
         
         // Check 1: SuperBlock integrity
-        cout << "[1/5] Checking SuperBlock...\n";
+        lout << "[1/5] Checking SuperBlock...\n";
         if (sb.magic != MAGIC) {
-            cout << "  ERROR: Invalid magic number!\n";
+            lout << "  ERROR: Invalid magic number!\n";
             errors++;
         } else {
-            cout << "  OK: Magic number valid.\n";
+            lout << "  OK: Magic number valid.\n";
         }
         
         if (sb.totalClusters == 0 || sb.totalClusters > 0xFFFFFFFF) {
-            cout << "  ERROR: Invalid cluster count!\n";
+            lout << "  ERROR: Invalid cluster count!\n";
             errors++;
         } else {
-            cout << "  OK: Cluster count valid (" << sb.totalClusters << ").\n";
+            lout << "  OK: Cluster count valid (" << sb.totalClusters << ").\n";
         }
         
         // Check 2: Root directory
-        cout << "[2/5] Checking root directory...\n";
+        lout << "[2/5] Checking root directory...\n";
         if (sb.rootDirCluster == 0 || sb.rootDirCluster >= sb.totalClusters) {
-            cout << "  ERROR: Invalid root directory cluster!\n";
+            lout << "  ERROR: Invalid root directory cluster!\n";
             errors++;
         } else {
             uint8_t testBuf[SECTOR_SIZE];
             if (!disk.readSector(sb.rootDirCluster * 8, testBuf)) {
-                cout << "  ERROR: Cannot read root directory!\n";
+                lout << "  ERROR: Cannot read root directory!\n";
                 errors++;
             } else {
-                cout << "  OK: Root directory readable.\n";
+                lout << "  OK: Root directory readable.\n";
             }
         }
         
         // Check 3: Level registry
-        cout << "[3/5] Checking level registry...\n";
+        lout << "[3/5] Checking level registry...\n";
         if (sb.levelRegistryCluster == 0) {
-            cout << "  WARNING: No level registry.\n";
+            lout << "  WARNING: No level registry.\n";
             warnings++;
         } else {
             int levelCount = 0;
@@ -1539,12 +1540,12 @@ found:
                     }
                 }
             }
-            cout << "  OK: " << levelCount << " active levels found.\n";
+            lout << "  OK: " << levelCount << " active levels found.\n";
         }
         
         // Check 4: Free space consistency
-        cout << "[4/5] Checking free space... ";
-        cout.flush();
+        lout << "[4/5] Checking free space... ";
+        lout.flush();
         
         uint64_t reportedFree = sb.totalFreeClusters;
         uint64_t sampleFree = 0;
@@ -1566,39 +1567,39 @@ found:
             
             // Update spinner every 1000 samples
             if (sampleCount % 10 == 0) {
-                cout << "\b" << spinner[spinIdx++ % 4];
-                cout.flush();
+                lout << "\b" << spinner[spinIdx++ % 4];
+                lout.flush();
             }
         }
         
-        cout << "\b \n";  // Clear spinner
+        lout << "\b \n";  // Clear spinner
         
         // Estimate total free from sample
         if (sampleCount > 0 && sampleFree > 0) {
             uint64_t estimatedFree = (sampleFree * 100);  // Scale up from sampling
-            cout << "  OK: ~" << estimatedFree << " free clusters (sampled).\n";
+            lout << "  OK: ~" << estimatedFree << " free clusters (sampled).\n";
         } else if (reportedFree > 0) {
-            cout << "  OK: " << reportedFree << " free clusters (from superblock).\n";
+            lout << "  OK: " << reportedFree << " free clusters (from superblock).\n";
         } else {
-            cout << "  WARNING: Disk may be full.\n";
+            lout << "  WARNING: Disk may be full.\n";
             warnings++;
         }
         
         // Check 5: Journal
-        cout << "[5/5] Checking journal...\n";
+        lout << "[5/5] Checking journal...\n";
         if (sb.journalStartCluster == 0) {
-            cout << "  WARNING: No journal configured.\n";
+            lout << "  WARNING: No journal configured.\n";
             warnings++;
         } else {
-            cout << "  OK: Journal at cluster " << sb.journalStartCluster << ".\n";
+            lout << "  OK: Journal at cluster " << sb.journalStartCluster << ".\n";
         }
         
-        cout << "\n=== Check Complete ===\n";
-        cout << "Errors: " << errors << ", Warnings: " << warnings << "\n";
+        lout << "\n=== Check Complete ===\n";
+        lout << "Errors: " << errors << ", Warnings: " << warnings << "\n";
         if (errors == 0) {
-            cout << "Filesystem appears healthy.\n";
+            lout << "Filesystem appears healthy.\n";
         } else {
-            cout << "Filesystem has errors. Consider reformatting.\n";
+            lout << "Filesystem has errors. Consider reformatting.\n";
         }
     }
     
@@ -1639,12 +1640,12 @@ found:
         
         LevelDescriptor* level = findLevelByID(levelID);
         if (!level) {
-            cout << "Level ID " << levelID << " not found.\n";
+            lout << "Level ID " << levelID << " not found.\n";
             return;
         }
         
         PathResult res = resolvePath(path);
-        if (!res.valid) { cout << "Invalid path.\n"; return; }
+        if (!res.valid) { lout << "Invalid path.\n"; return; }
         
         DirEntry entries[SECTOR_SIZE/sizeof(DirEntry)];
         vector<uint64_t> chain = getChain(res.parentCluster);
@@ -1665,14 +1666,14 @@ found:
                         level->refCount++;
                         updateLevelDescriptor(*level);
                         
-                        cout << "Mounted level '" << level->name << "' (ID: " << levelID 
+                        lout << "Mounted level '" << level->name << "' (ID: " << levelID 
                              << ") at '" << res.name << "'\n";
                         return;
                     }
                 }
             }
         }
-        cout << "No space to create mount point.\n";
+        lout << "No space to create mount point.\n";
     }
     
     void updateLevelDescriptor(LevelDescriptor& updated) {
@@ -1718,22 +1719,22 @@ found:
                 if (context.currentPath == "/") {
                     if (loadVersion(levelName)) {
                         context.rootVersion = levelName;
-                        cout << "Switched to root level '" << levelName << "'\n";
+                        lout << "Switched to root level '" << levelName << "'\n";
                     } else {
-                        cout << "Level '" << levelName << "' not found.\n";
+                        lout << "Level '" << levelName << "' not found.\n";
                     }
                 } else {
                     if (loadVersion(levelName)) {
-                        cout << "Switched to level '" << levelName << "'\n";
+                        lout << "Switched to level '" << levelName << "'\n";
                     } else {
-                        cout << "Level '" << levelName << "' not found.\n";
+                        lout << "Level '" << levelName << "' not found.\n";
                     }
                 }
                 return;
             }
         } else if (path.rfind(":", 0) == 0) {
-             if (switchLevel(path.substr(1))) cout << "Switched to " << path.substr(1) << endl;
-             else cout << "Version not found.\n";
+             if (switchLevel(path.substr(1))) lout << "Switched to " << path.substr(1) << endl;
+             else lout << "Version not found.\n";
              return;
         }
 
@@ -1747,11 +1748,11 @@ found:
                     if (entries[j].type == TYPE_LEVELED_DIR && string(entries[j].name) == folderName) {
                         // Check permissions before entering
                         if (!(entries[j].attributes & PERM_READ)) {
-                            cout << "Permission denied: no read access to '" << folderName << "'.\n";
+                            lout << "Permission denied: no read access to '" << folderName << "'.\n";
                             return;
                         }
                         if (!(entries[j].attributes & PERM_EXEC)) {
-                            cout << "Permission denied: no execute access to enter '" << folderName << "'.\n";
+                            lout << "Permission denied: no execute access to enter '" << folderName << "'.\n";
                             return;
                         }
                         context.currentFolderPerms = entries[j].attributes;
@@ -1766,17 +1767,17 @@ found:
                             context.currentLevelID = level->levelID;
                             context.currentVersion = level->name;
                             context.currentPath += folderName + "/";
-                            cout << "Entered level mount '" << folderName << "' -> Level '" 
+                            lout << "Entered level mount '" << folderName << "' -> Level '" 
                                  << level->name << "' (ID: " << level->levelID << ")\n";
                         } else {
-                            cout << "Mounted level not found.\n";
+                            lout << "Mounted level not found.\n";
                         }
                         return;
                     }
                 }
             }
         }
-        cout << "Folder not found.\n";
+        lout << "Folder not found.\n";
     }
     
     void enterFolder(uint64_t cluster, string name, string level) {
@@ -1790,8 +1791,8 @@ found:
          }
     }
         if (versions.empty()) {
-            cout << "Folder " << name << " has no versions.\n";
-            cout << "Create default 'main'? (y/n): ";
+            lout << "Folder " << name << " has no versions.\n";
+            lout << "Create default 'main'? (y/n): ";
             char ans; cin >> ans;
             if (ans == 'y') {
                 addLevel(cluster, "main");
@@ -1799,9 +1800,9 @@ found:
             } else return;
         }
         if (level.empty()) {
-            cout << "Available versions: ";
-            for (const auto& v : versions) cout << "[" << v << "] ";
-            cout << "\nSelect version: ";
+            lout << "Available versions: ";
+            for (const auto& v : versions) lout << "[" << v << "] ";
+            lout << "\nSelect version: ";
             cin >> level;
         }
     // Find content
@@ -1819,7 +1820,7 @@ found:
          }
          if(found) break;
     }    
-        if (!found) { cout << "Version not found.\n"; return; }
+        if (!found) { lout << "Version not found.\n"; return; }
         context.currentDirCluster = cluster;
         context.currentContentCluster = newContent;
         context.currentVersion = level;
@@ -1873,7 +1874,7 @@ found:
     void addLevel(uint64_t cluster, string name) {
         uint64_t cont = allocCluster();
         if (cont == 0) {
-            cout << "Disk full. Cannot add level.\n";
+            lout << "Disk full. Cannot add level.\n";
             return;
         }
         
@@ -1895,7 +1896,7 @@ found:
                          vps[j].parentLevelID = context.currentLevelID;
                          vps[j].flags = LEVEL_FLAG_ACTIVE;
                          disk.writeSector(c * 8 + i, vpsBuf);
-                         cout << "Added level '" << name << "' (ID: " << newLevelID << ", Parent: " << context.currentLevelID << ")\n";
+                         lout << "Added level '" << name << "' (ID: " << newLevelID << ", Parent: " << context.currentLevelID << ")\n";
                          return;
                      }
                  }
@@ -1905,7 +1906,7 @@ found:
         uint64_t lastCluster = chain.back();
         uint64_t newCluster = allocCluster();
         if (newCluster == 0) {
-            cout << "Disk full. Cannot add level.\n";
+            lout << "Disk full. Cannot add level.\n";
             return;
         }
         
@@ -1921,7 +1922,7 @@ found:
         vps[0].parentLevelID = context.currentLevelID;
         vps[0].flags = LEVEL_FLAG_ACTIVE;
         for (int i=0; i<8; i++) disk.writeSector(newCluster * 8 + i, vpsBuf);
-        cout << "Added level '" << name << "' (ID: " << newLevelID << ", extended chain)\n";
+        lout << "Added level '" << name << "' (ID: " << newLevelID << ", extended chain)\n";
     }
     
     void branchLevel(string folderName, string parentLevelName, string newLevelName) {
@@ -1929,7 +1930,7 @@ found:
         
         uint64_t folderCluster = findFolderCluster(folderName);
         if (!folderCluster) {
-            cout << "Folder '" << folderName << "' not found.\n";
+            lout << "Folder '" << folderName << "' not found.\n";
             return;
         }
         
@@ -1955,13 +1956,13 @@ found:
     }
 found_parent:
         if (!parentEntry) {
-            cout << "Parent level '" << parentLevelName << "' not found.\n";
+            lout << "Parent level '" << parentLevelName << "' not found.\n";
             return;
         }
         
         uint64_t newContentCluster = allocCluster();
         if (newContentCluster == 0) {
-            cout << "Disk full. Cannot branch level.\n";
+            lout << "Disk full. Cannot branch level.\n";
             return;
         }
         
@@ -2030,7 +2031,7 @@ found_parent:
                     disk.writeSector(c * 8 + i, vpsBuf);
                     
                     writeSuperBlock();
-                        cout << "Branched level '" << newLevelName << "' (ID: " << newLevelID 
+                        lout << "Branched level '" << newLevelName << "' (ID: " << newLevelID 
                              << ") from '" << parentLevelName << "' (ID: " << parentLevelID << ")\n";
                         return;
                     }
@@ -2038,7 +2039,7 @@ found_parent:
             }
         }
         
-        cout << "No space in version table. Cannot branch.\n";
+        lout << "No space in version table. Cannot branch.\n";
     }
     
     uint64_t findFolderCluster(string folderName) {
@@ -2060,7 +2061,7 @@ found_parent:
         if (!disk.isOpen()) return;
         uint64_t cluster = findFolderCluster(folderName);
         if (!cluster) {
-            cout << "Folder '" << folderName << "' not found.\n";
+            lout << "Folder '" << folderName << "' not found.\n";
             return;
         }
         addLevel(cluster, levelName);
@@ -2074,7 +2075,7 @@ found_parent:
         if (!disk.isOpen()) return;
         
         if (!(context.currentFolderPerms & PERM_WRITE)) {
-            cout << "Permission denied: current folder is read-only.\n";
+            lout << "Permission denied: current folder is read-only.\n";
             return;
         }
         
@@ -2082,7 +2083,7 @@ found_parent:
         PathResult res2 = resolvePath(dir2Path);
         
         if (!res1.valid || !res2.valid) {
-            cout << "Invalid directory path.\n";
+            lout << "Invalid directory path.\n";
             return;
         }
         
@@ -2110,19 +2111,19 @@ found_parent:
         }
         
         if (!dir1Cluster || !dir2Cluster) {
-            cout << "One or both directories not found.\n";
+            lout << "One or both directories not found.\n";
             return;
         }
         
         if (dir1Cluster == dir2Cluster) {
-            cout << "Cannot link a directory to itself.\n";
+            lout << "Cannot link a directory to itself.\n";
             return;
         }
         
         // Allocate shared content table cluster
         uint64_t sharedContentCluster = allocCluster();
         if (sharedContentCluster == 0) {
-            cout << "Disk full. Cannot create shared level.\n";
+            lout << "Disk full. Cannot create shared level.\n";
             return;
         }
         
@@ -2136,20 +2137,20 @@ found_parent:
         // Add level to first directory
         bool added1 = addLevelWithCluster(dir1Cluster, sharedLevelName, sharedContentCluster);
         if (!added1) {
-            cout << "Failed to add level to first directory.\n";
+            lout << "Failed to add level to first directory.\n";
             return;
         }
         
         // Add level to second directory (pointing to SAME cluster)
         bool added2 = addLevelWithCluster(dir2Cluster, sharedLevelName, sharedContentCluster);
         if (!added2) {
-            cout << "Failed to add level to second directory.\n";
+            lout << "Failed to add level to second directory.\n";
             return;
         }
         
-        cout << "Created shared level '" << sharedLevelName << "' linking:\n";
-        cout << "  " << dir1Path << " <-> " << dir2Path << "\n";
-        cout << "Changes in one will appear in the other (DAG structure).\n";
+        lout << "Created shared level '" << sharedLevelName << "' linking:\n";
+        lout << "  " << dir1Path << " <-> " << dir2Path << "\n";
+        lout << "Changes in one will appear in the other (DAG structure).\n";
     }
     
     bool addLevelWithCluster(uint64_t dirCluster, string levelName, uint64_t contentCluster) {
@@ -2215,36 +2216,42 @@ found_parent:
     void read(string path) {
         if (!disk.isOpen()) return;
         PathResult res = resolvePath(path);
-        if (!res.valid) { cout << "Invalid path.\n"; return; }
+        if (!res.valid) { lout << "Invalid path.\n"; return; }
         
         vector<DirEntry> entries = readDirEntries(res.parentCluster);
         bool found = false;
         DirEntry fileEntry;
+        uint64_t fileCluster = 0;
         
-        // Find entry (can be file, symlink, or hardlink)
         for (const auto& e : entries) {
             if ((e.type == TYPE_FILE || e.type == TYPE_SYMLINK || e.type ==TYPE_HARDLINK) && 
                 string(e.name) == res.name) {
                 fileEntry = e;
+                fileCluster = e.startCluster;
                 found = true;
                 break;
             }
         }
         
-        if (!found) { cout << "File not found.\n"; return; }
+        if (!found) { lout << "File not found.\n"; return; }
         
         // Check read permission
         if (!(fileEntry.attributes & PERM_READ)) {
-            cout << "Permission denied: no read access.\n";
+            lout << "Permission denied: no read access.\n";
             return;
         }
         
+        ScopedFileLock readLock(lockManager, fileCluster, path, LFS_LOCK_SHARED, 5000);
+        if (!readLock.isHeld()) {
+            lout << "File is locked by another process.\n";
+            return;
+        }
         
         // Follow symlink (with loop detection)
         int symlinkDepth = 0;
         while (fileEntry.type == TYPE_SYMLINK && symlinkDepth < 10) {
             if (fileEntry.startCluster == 0) {
-                cout << "Broken symlink.\n";
+                lout << "Broken symlink.\n";
                 return;
             }
             
@@ -2258,7 +2265,7 @@ found_parent:
             // Resolve target
             PathResult targetRes = resolvePath(string(targetPath));
             if (!targetRes.valid) {
-                cout << "Broken symlink: target '" << targetPath << "' not found.\n";
+                lout << "Broken symlink: target '" << targetPath << "' not found.\n";
                 return;
             }
             
@@ -2274,14 +2281,14 @@ found_parent:
             }
             
             if (!found) {
-                cout << "Broken symlink: target not found.\n";
+                lout << "Broken symlink: target not found.\n";
                 return;
             }
             symlinkDepth++;
         }
         
         if (symlinkDepth >= 10) {
-            cout << "Symlink loop detected or max depth exceeded.\n";
+            lout << "Symlink loop detected or max depth exceeded.\n";
             return;
         }
         
@@ -2299,16 +2306,16 @@ found_parent:
             for (int i=0; i<8; i++) {
                 disk.readSector(c*8 + i, buffer + (i*SECTOR_SIZE));
             }
-            cout.write(buffer, toRead);
+            lout.write(buffer, toRead);
             remaining -= toRead;
         }
-        cout << endl;
+        lout << endl;
     }
 
     void deleteLevel(string folderName, string levelName) {
         uint64_t folderCluster = findFolderCluster(folderName);
         if (folderCluster == 0) {
-            cout << "Folder '" << folderName << "' not found.\n";
+            lout << "Folder '" << folderName << "' not found.\n";
             return;
         }
         
@@ -2335,7 +2342,7 @@ found_parent:
                     }
 level_check_done:
                     if (hasContents) {
-                        cout << "Level '" << levelName << "' is not empty. Delete contents first.\n";
+                        lout << "Level '" << levelName << "' is not empty. Delete contents first.\n";
                         return;
                     }
                     
@@ -2345,12 +2352,12 @@ level_check_done:
                     
                     memset(&vps[j], 0, sizeof(VersionEntry));
                     disk.writeSector(folderCluster * 8 + s, vpsBuf);
-                    cout << "Deleted level '" << levelName << "' from '" << folderName << "'.\n";
+                    lout << "Deleted level '" << levelName << "' from '" << folderName << "'.\n";
                     return;
                 }
             }
         }
-        cout << "Level '" << levelName << "' not found in '" << folderName << "'.\n";
+        lout << "Level '" << levelName << "' not found in '" << folderName << "'.\n";
     }
 
     bool isLevelShared(uint64_t contentCluster, uint64_t excludeFolderCluster) {
@@ -2385,7 +2392,7 @@ level_check_done:
         if (!disk.isOpen()) return;
         
         if (!(context.currentFolderPerms & PERM_WRITE)) {
-            cout << "Permission denied: current folder is read-only.\n";
+            lout << "Permission denied: current folder is read-only.\n";
             return;
         }
         
@@ -2398,7 +2405,7 @@ level_check_done:
         }
         
         PathResult res = resolvePath(path);
-        if (!res.valid) { cout << "Item not found.\n"; return; }
+        if (!res.valid) { lout << "Item not found.\n"; return; }
 
         DirEntry entries[SECTOR_SIZE/sizeof(DirEntry)];
         uint64_t foundCluster = 0;
@@ -2433,15 +2440,22 @@ level_check_done:
                                  }
                              }
                              if (hasContents) {
-                                 cout << "Folder '" << res.name << "' is not empty. Use 'del -r " << path << "'.\n";
+                                 lout << "Folder '" << res.name << "' is not empty. Use 'del -r " << path << "'.\n";
                                  return;
                              }
                         }
                         
                         // Check write permission for files
                         if (entries[j].type == TYPE_FILE && !(entries[j].attributes & PERM_WRITE)) {
-                            cout << "Permission denied: no write access to delete '" << res.name << "'.\n";
+                            lout << "Permission denied: no write access to delete '" << res.name << "'.\n";
                             return;
+                        }
+                        
+                        if (entries[j].type == TYPE_FILE && entries[j].startCluster != 0) {
+                            if (lockManager.isFileLocked(entries[j].startCluster, LFS_LOCK_SHARED)) {
+                                lout << "Cannot delete: file is locked by another operation.\n";
+                                return;
+                            }
                         }
                         
                         // Handle hardlink reference counting
@@ -2450,14 +2464,14 @@ level_check_done:
                                 // Decrement reference count for all links pointing to this data
                                 uint64_t dataCluster = entries[j].startCluster;
                                 decrementRefCount(dataCluster);
-                                cout << "Deleted hardlink " << res.name << " (refcount decremented).\n";
+                                lout << "Deleted hardlink " << res.name << " (refcount decremented).\n";
                             } else {
-                                cout << "Deleted " << res.name << ".\n";
+                                lout << "Deleted " << res.name << ".\n";
                             }
                         } else if (entries[j].type == TYPE_SYMLINK) {
-                            cout << "Deleted symlink " << res.name << ".\n";
+                            lout << "Deleted symlink " << res.name << ".\n";
                         } else {
-                            cout << "Deleted " << res.name << ".\n";
+                            lout << "Deleted " << res.name << ".\n";
                         }
                         
                         if (entries[j].startCluster != 0 && entries[j].type != TYPE_SYMLINK) {
@@ -2469,7 +2483,7 @@ level_check_done:
                                     for (int v = 0; v < SECTOR_SIZE/sizeof(VersionEntry); v++) {
                                         if (vps[v].isActive && vps[v].contentTableCluster != 0) {
                                             if (isLevelShared(vps[v].contentTableCluster, entries[j].startCluster)) {
-                                                cout << "  Level '" << vps[v].versionName << "' is shared, detaching (not deleted).\n";
+                                                lout << "  Level '" << vps[v].versionName << "' is shared, detaching (not deleted).\n";
                                             } else {
                                                 freeChain(vps[v].contentTableCluster);
                                             }
@@ -2490,7 +2504,7 @@ level_check_done:
                 }
             }
         }
-        cout << "Target not found.\n";
+        lout << "Target not found.\n";
     }
     
     void decrementRefCount(uint64_t dataCluster) {
@@ -2517,15 +2531,15 @@ level_check_done:
         if (!disk.isOpen()) return;
         
         if (srcPath.find(':') != string::npos || dstPath.find(':') != string::npos) {
-            cout << "Cannot move levels. Use level commands instead.\n";
+            lout << "Cannot move levels. Use level commands instead.\n";
             return;
         }
         
         PathResult srcRes = resolvePath(srcPath);
-        if (!srcRes.valid) { cout << "Source not found.\n"; return; }
+        if (!srcRes.valid) { lout << "Source not found.\n"; return; }
         
         PathResult dstRes = resolvePath(dstPath);
-        if (!dstRes.valid) { cout << "Invalid destination path.\n"; return; }
+        if (!dstRes.valid) { lout << "Invalid destination path.\n"; return; }
 
         DirEntry srcEntry;
         bool found = false;
@@ -2538,6 +2552,12 @@ level_check_done:
                 disk.readSector(c * 8 + i, entries);
                 for (int j=0; j<SECTOR_SIZE/sizeof(DirEntry); j++) {
                     if (entries[j].type != TYPE_FREE && string(entries[j].name) == srcRes.name) {
+                        if (entries[j].type == TYPE_FILE && entries[j].startCluster != 0) {
+                            if (lockManager.isFileLocked(entries[j].startCluster, LFS_LOCK_SHARED)) {
+                                lout << "Cannot move: file is in use.\n";
+                                return;
+                            }
+                        }
                         srcEntry = entries[j];
                         found = true;
                         entries[j].type = TYPE_FREE;
@@ -2548,7 +2568,7 @@ level_check_done:
             }
         }
 found_src:
-        if (!found) { cout << "Source not found.\n"; return; }
+        if (!found) { lout << "Source not found.\n"; return; }
         
         // Write to Dest - Follow LAT chain
         vector<uint64_t> dstChain = getChain(dstRes.parentCluster);
@@ -2560,7 +2580,7 @@ found_src:
                         entries[j] = srcEntry;
                         strcpy(entries[j].name, dstRes.name.c_str());
                         disk.writeSector(c * 8 + i, entries);
-                        cout << "Moved " << srcPath << " to " << dstPath << endl;
+                        lout << "Moved " << srcPath << " to " << dstPath << endl;
                         return;
                     }
                 }
@@ -2572,7 +2592,7 @@ found_src:
         if (!disk.isOpen()) return;
         uint64_t cluster = findFolderCluster(folderName);
         if (!cluster) {
-            cout << "Folder '" << folderName << "' not found.\n";
+            lout << "Folder '" << folderName << "' not found.\n";
             return;
         }
         char vpsBuf[SECTOR_SIZE];
@@ -2583,24 +2603,24 @@ found_src:
              for(int j=0; j<SECTOR_SIZE/sizeof(VersionEntry); j++) {
                  if (vps[j].isActive && string(vps[j].versionName) == levelName) {
                      if (levelName == "master") {
-                         cout << "Cannot remove master level.\n";
+                         lout << "Cannot remove master level.\n";
                          return;
                      }
                      vps[j].isActive = 0;
                      disk.writeSector(cluster * 8 + i, vpsBuf);
-                     cout << "Removed level " << levelName << " from " << folderName << endl;
+                     lout << "Removed level " << levelName << " from " << folderName << endl;
                      return;
                  }
              }
         }
-        cout << "Level '" << levelName << "' not found.\n";
+        lout << "Level '" << levelName << "' not found.\n";
     }
 
     void levelRename(string folderName, string oldName, string newName) {
         if (!disk.isOpen()) return;
         uint64_t cluster = findFolderCluster(folderName);
         if (!cluster) {
-            cout << "Folder '" << folderName << "' not found.\n";
+            lout << "Folder '" << folderName << "' not found.\n";
             return;
         }
         char vpsBuf[SECTOR_SIZE];
@@ -2612,19 +2632,19 @@ found_src:
                  if (vps[j].isActive && string(vps[j].versionName) == oldName) {
                      strcpy(vps[j].versionName, newName.c_str());
                      disk.writeSector(cluster * 8 + i, vpsBuf);
-                     cout << "Renamed level " << oldName << " to " << newName << " in " << folderName << "\n";
+                     lout << "Renamed level " << oldName << " to " << newName << " in " << folderName << "\n";
                      return;
                  }
              }
         }
-        cout << "Level '" << oldName << "' not found.\n";
+        lout << "Level '" << oldName << "' not found.\n";
     }
 
     void rename(string path, string newName) {
         if (!disk.isOpen()) return;
         
         if (!(context.currentFolderPerms & PERM_WRITE)) {
-            cout << "Permission denied: current folder is read-only.\n";
+            lout << "Permission denied: current folder is read-only.\n";
             return;
         }
         
@@ -2637,10 +2657,10 @@ found_src:
         }
         
         PathResult res = resolvePath(path);
-        if (!res.valid) { cout << "Item not found.\n"; return; }
+        if (!res.valid) { lout << "Item not found.\n"; return; }
         
         if (newName.length() > 23) {
-            cout << "Name too long (max 23 characters).\n";
+            lout << "Name too long (max 23 characters).\n";
             return;
         }
         
@@ -2652,8 +2672,15 @@ found_src:
                 for (int j = 0; j < SECTOR_SIZE / sizeof(DirEntry); j++) {
                     if (entries[j].type != TYPE_FREE && string(entries[j].name) == res.name) {
                         if (!(entries[j].attributes & PERM_WRITE) && entries[j].type == TYPE_FILE) {
-                            cout << "Permission denied: no write access.\n";
+                            lout << "Permission denied: no write access.\n";
                             return;
+                        }
+                        
+                        if (entries[j].type == TYPE_FILE && entries[j].startCluster != 0) {
+                            if (lockManager.isFileLocked(entries[j].startCluster, LFS_LOCK_SHARED)) {
+                                lout << "Cannot rename: file is in use.\n";
+                                return;
+                            }
                         }
                         
                         strncpy(entries[j].name, newName.c_str(), 23);
@@ -2666,24 +2693,24 @@ found_src:
                         else if (entries[j].type == TYPE_LEVELED_DIR) typeStr = "folder";
                         else if (entries[j].type == TYPE_SYMLINK) typeStr = "symlink";
                         
-                        cout << "Renamed " << typeStr << " '" << res.name << "' to '" << newName << "'.\n";
+                        lout << "Renamed " << typeStr << " '" << res.name << "' to '" << newName << "'.\n";
                         return;
                     }
                 }
             }
         }
-        cout << "Item not found.\n";
+        lout << "Item not found.\n";
     }
     
     void renameLevel(string folderName, string levelName, string newName) {
         uint64_t folderCluster = findFolderCluster(folderName);
         if (folderCluster == 0) {
-            cout << "Folder '" << folderName << "' not found.\n";
+            lout << "Folder '" << folderName << "' not found.\n";
             return;
         }
         
         if (newName.length() > 31) {
-            cout << "Level name too long (max 31 characters).\n";
+            lout << "Level name too long (max 31 characters).\n";
             return;
         }
         
@@ -2698,24 +2725,24 @@ found_src:
                     vps[j].versionName[31] = '\0';
                     vps[j].modTime = time(0);
                     disk.writeSector(folderCluster * 8 + s, vpsBuf);
-                    cout << "Renamed level '" << levelName << "' to '" << newName << "'.\n";
+                    lout << "Renamed level '" << levelName << "' to '" << newName << "'.\n";
                     return;
                 }
             }
         }
-        cout << "Level '" << levelName << "' not found in '" << folderName << "'.\n";
+        lout << "Level '" << levelName << "' not found in '" << folderName << "'.\n";
     }
 
 
     void current() {
         if (!disk.isOpen()) {
-            cout << "Not mounted.\n";
+            lout << "Not mounted.\n";
             return;
         }
-        cout << "Path: " << context.currentPath << "\n";
-        cout << "Level: " << context.currentVersion << "\n";
-        cout << "Directory Cluster: " << context.currentDirCluster << "\n";
-        cout << "Content Cluster: " << context.currentContentCluster << "\n";
+        lout << "Path: " << context.currentPath << "\n";
+        lout << "Level: " << context.currentVersion << "\n";
+        lout << "Directory Cluster: " << context.currentDirCluster << "\n";
+        lout << "Content Cluster: " << context.currentContentCluster << "\n";
     }
 
     void write(string path) {
@@ -2723,12 +2750,12 @@ found_src:
         
         // Check if current folder allows write (for new files)
         if (!(context.currentFolderPerms & PERM_WRITE)) {
-            cout << "Permission denied: current folder is read-only.\n";
+            lout << "Permission denied: current folder is read-only.\n";
             return;
         }
         
         PathResult res = resolvePath(path);
-        if (!res.valid) { cout << "Invalid path location.\n"; return; }
+        if (!res.valid) { lout << "Invalid path location.\n"; return; }
         string name = res.name;
         uint64_t contentCluster = res.parentCluster;
         
@@ -2776,25 +2803,32 @@ found_src:
                      }
                  }
             }
-            cout << "Directory full.\n";
+            lout << "Directory full.\n";
             return;
         }
 
 scan_done:
         // Check write permission for existing files
         if (!isNew && !(foundEntry.attributes & PERM_WRITE)) {
-            cout << "Permission denied: no write access to '" << name << "'.\n";
+            lout << "Permission denied: no write access to '" << name << "'.\n";
             return;
         }
         
-        cout << "--- Editor: " << name << " ---\n";
-        cout << "Type content. End with line '.done'\n";
+        uint64_t lockCluster = isNew ? 0 : foundEntry.startCluster;
+        ScopedFileLock writeLock(lockManager, lockCluster, path, LFS_LOCK_EXCLUSIVE, 5000);
+        if (lockCluster != 0 && !writeLock.isHeld()) {
+            lout << "File is locked by another process.\n";
+            return;
+        }
+        
+        lout << "--- Editor: " << name << " ---\n";
+        lout << "Type content. End with line '.done'\n";
         string content, line;
         while (getline(cin, line)) {
             if (line == ".done") break;
             content += line + "\n";
         }
-        if (content.empty()) { cout << "No content.\n"; return; }
+        if (content.empty()) { lout << "No content.\n"; return; }
         
         vector<uint8_t> data(content.begin(), content.end());
 
@@ -2812,7 +2846,7 @@ scan_done:
             entryPtr->startCluster = allocCluster();
             entryPtr->createTime = time(0);
             entryPtr->attributes = PERM_DEFAULT;
-            if (entryPtr->startCluster == 0) { cout << "Disk full.\n"; return; }
+            if (entryPtr->startCluster == 0) { lout << "Disk full.\n"; return; }
         }
         
         entryPtr->modTime = time(0);
@@ -2841,7 +2875,7 @@ scan_done:
                  uint64_t next = getLATEntry(current);
                  if (next == LAT_END || next == 0) {
                      next = allocCluster();
-                     if (next == 0) { cout << "Disk full during write.\n"; break; }
+                     if (next == 0) { lout << "Disk full during write.\n"; break; }
                      setLATEntry(current, next);
                  }
                  current = next;
@@ -2851,14 +2885,14 @@ scan_done:
         
         journal->commitOperation(txId);
         
-        cout << "Written " << total << " bytes.\n";
+        lout << "Written " << total << " bytes.\n";
     }
 
     void writeInsert(string path) {
         if (!disk.isOpen()) return;
         
         PathResult res = resolvePath(path);
-        if (!res.valid) { cout << "File not found.\n"; return; }
+        if (!res.valid) { lout << "File not found.\n"; return; }
         
         DirEntry targetEntry;
         uint64_t entrySector = 0;
@@ -2882,10 +2916,10 @@ scan_done:
             }
         }
 found_file:
-        if (!found) { cout << "File not found.\n"; return; }
+        if (!found) { lout << "File not found.\n"; return; }
         
         if (!(targetEntry.attributes & PERM_WRITE)) {
-            cout << "Permission denied: no write access.\n";
+            lout << "Permission denied: no write access.\n";
             return;
         }
         
@@ -2914,15 +2948,15 @@ found_file:
         }
         
         if (lines.empty()) {
-            cout << "File is empty. Use 'write' instead.\n";
+            lout << "File is empty. Use 'write' instead.\n";
             return;
         }
         
         int selectedLine = 0;
         bool done = false;
         
-        cout << "\n=== Insert Mode ===\n";
-        cout << "Use UP/DOWN arrows to select line, ENTER to insert before it, ESC to cancel.\n\n";
+        lout << "\n=== Insert Mode ===\n";
+        lout << "Use UP/DOWN arrows to select line, ENTER to insert before it, ESC to cancel.\n\n";
         
         HANDLE hConsole = GetStdHandle(STD_INPUT_HANDLE);
         DWORD oldMode;
@@ -2930,27 +2964,27 @@ found_file:
         SetConsoleMode(hConsole, 0);
         
         auto displayLines = [&]() {
-            cout << "\033[2J\033[H";
-            cout << "=== Insert Mode: " << res.name << " ===\n";
-            cout << "UP/DOWN to navigate, ENTER to insert before selected line, ESC to cancel\n";
-            cout << string(50, '-') << "\n";
+            lout << "\033[2J\033[H";
+            lout << "=== Insert Mode: " << res.name << " ===\n";
+            lout << "UP/DOWN to navigate, ENTER to insert before selected line, ESC to cancel\n";
+            lout << string(50, '-') << "\n";
             
             for (size_t i = 0; i < lines.size(); i++) {
                 if ((int)i == selectedLine) {
-                    cout << ">> ";
+                    lout << ">> ";
                 } else {
-                    cout << "   ";
+                    lout << "   ";
                 }
-                cout << setw(3) << (i + 1) << ": ";
+                lout << setw(3) << (i + 1) << ": ";
                 if (lines[i].length() > 60) {
-                    cout << lines[i].substr(0, 57) << "...";
+                    lout << lines[i].substr(0, 57) << "...";
                 } else {
-                    cout << lines[i];
+                    lout << lines[i];
                 }
-                cout << "\n";
+                lout << "\n";
             }
-            cout << string(50, '-') << "\n";
-            cout << "Selected: Line " << (selectedLine + 1) << "\n";
+            lout << string(50, '-') << "\n";
+            lout << "Selected: Line " << (selectedLine + 1) << "\n";
         };
         
         displayLines();
@@ -2971,7 +3005,7 @@ found_file:
                             break;
                         case VK_RETURN: {
                             SetConsoleMode(hConsole, oldMode);
-                            cout << "\nEnter line to insert (or empty to cancel): ";
+                            lout << "\nEnter line to insert (or empty to cancel): ";
                             string newLine;
                             getline(cin, newLine);
                             
@@ -3011,7 +3045,7 @@ found_file:
                                         uint64_t next = getLATEntry(current);
                                         if (next == LAT_END || next == 0) {
                                             next = allocCluster();
-                                            if (next == 0) { cout << "Disk full.\n"; break; }
+                                            if (next == 0) { lout << "Disk full.\n"; break; }
                                             setLATEntry(current, next);
                                         }
                                         current = next;
@@ -3019,16 +3053,16 @@ found_file:
                                 }
                                 setLATEntry(current, LAT_END);
                                 
-                                cout << "Inserted line at position " << (selectedLine + 1) << ".\n";
+                                lout << "Inserted line at position " << (selectedLine + 1) << ".\n";
                             } else {
-                                cout << "Cancelled.\n";
+                                lout << "Cancelled.\n";
                             }
                             done = true;
                             break;
                         }
                         case VK_ESCAPE:
                             done = true;
-                            cout << "\nCancelled.\n";
+                            lout << "\nCancelled.\n";
                             break;
                     }
                 }
@@ -3040,83 +3074,20 @@ found_file:
 
     void setVerbose(bool v) {
         disk.setVerbose(v);
-        cout << "Disk logging " << (v ? "ENABLED" : "DISABLED") << ".\n";
-    }
-    
-    void enableDiskCache(bool enable) {
-        disk.enableCache(enable);
-    }
-    
-    void clearDiskCache() {
-        disk.clearCache();
-        disk.resetCacheStats();
-    }
-    
-    void showCacheStats() {
-        disk.displayCacheStats();
-    }
-    
-    bool lockFile(const string& filename, bool exclusive = true) {
-        PathResult res = resolvePath(filename);
-        if (!res.valid) { cout << "File not found.\n"; return false; }
-        
-        vector<uint64_t> chain = getChain(res.parentCluster);
-        for (uint64_t c : chain) {
-            for (int i = 0; i < 8; i++) {
-                DirEntry entries[SECTOR_SIZE / sizeof(DirEntry)];
-                disk.readSector(c * 8 + i, entries);
-                for (int j = 0; j < SECTOR_SIZE / sizeof(DirEntry); j++) {
-                    if (entries[j].type == TYPE_FILE && string(entries[j].name) == res.name) {
-                        LfsLockType type = exclusive ? LFS_LOCK_EXCLUSIVE : LFS_LOCK_SHARED;
-                        LfsLockStatus status = lockManager.acquireFileLock(
-                            entries[j].startCluster, filename, type, 3000);
-                        return status == LFS_LOCK_ACQUIRED;
-                    }
-                }
-            }
-        }
-        cout << "File not found.\n";
-        return false;
-    }
-    
-    bool unlockFile(const string& filename) {
-        PathResult res = resolvePath(filename);
-        if (!res.valid) { cout << "File not found.\n"; return false; }
-        
-        vector<uint64_t> chain = getChain(res.parentCluster);
-        for (uint64_t c : chain) {
-            for (int i = 0; i < 8; i++) {
-                DirEntry entries[SECTOR_SIZE / sizeof(DirEntry)];
-                disk.readSector(c * 8 + i, entries);
-                for (int j = 0; j < SECTOR_SIZE / sizeof(DirEntry); j++) {
-                    if (entries[j].type == TYPE_FILE && string(entries[j].name) == res.name) {
-                        return lockManager.releaseFileLock(entries[j].startCluster);
-                    }
-                }
-            }
-        }
-        cout << "File not found.\n";
-        return false;
-    }
-    
-    void showLocks() {
-        lockManager.displayLocks();
-    }
-    
-    void setLockVerbose(bool v) {
-        lockManager.setVerbose(v);
+        lout << "Disk logging " << (v ? "ENABLED" : "DISABLED") << ".\n";
     }
 
+
     void listAllLevels() {
-        if (!disk.isOpen()) { cout << "Not mounted.\n"; return; }
-        if (sb.levelRegistryCluster == 0) { cout << "No Level Registry.\n"; return; }
+        if (!disk.isOpen()) { lout << "Not mounted.\n"; return; }
+        if (sb.levelRegistryCluster == 0) { lout << "No Level Registry.\n"; return; }
         
-        cout << "\n=== Global Level Registry ===\n";
-        cout << "  Total Levels: " << sb.totalLevels << "\n";
-        cout << "  Next Level ID: " << sb.nextLevelID << "\n\n";
-        cout << setw(4) << "ID" << "  " << setw(16) << left << "Name" 
+        lout << "\n=== Global Level Registry ===\n";
+        lout << "  Total Levels: " << sb.totalLevels << "\n";
+        lout << "  Next Level ID: " << sb.nextLevelID << "\n\n";
+        lout << setw(4) << "ID" << "  " << setw(16) << left << "Name" 
              << setw(8) << "Parent" << setw(10) << "RefCount" << "Flags\n";
-        cout << string(50, '-') << "\n";
+        lout << string(50, '-') << "\n";
         
         vector<uint64_t> chain = getChain(sb.levelRegistryCluster);
         
@@ -3134,7 +3105,7 @@ found_file:
                         if (registry[j].flags & LEVEL_FLAG_DERIVED) flagStr += "DRV ";
                         if (flagStr.empty()) flagStr = "ACT";
                         
-                        cout << setw(4) << right << registry[j].levelID << "  "
+                        lout << setw(4) << right << registry[j].levelID << "  "
                              << setw(16) << left << registry[j].name
                              << setw(8) << right << registry[j].parentLevelID
                              << setw(10) << registry[j].refCount
@@ -3143,7 +3114,7 @@ found_file:
                 }
             }
         }
-        cout << "\n";
+        lout << "\n";
     }
     
     uint64_t getCurrentLevelID() { return context.currentLevelID; }
@@ -3157,11 +3128,11 @@ int main(int argc, char** argv) {
     string input;
     
     // Welcome Screen
-    cout << "==========================================\n";
-    cout << "      Welcome to Linuxify LevelFS        \n";
-    cout << "==========================================\n";
-    cout << "Type 'help' for commands.\n";
-    cout << "Type 'log on' to see disk operations.\n\n";
+    lout << "==========================================\n";
+    lout << "      Welcome to Linuxify LevelFS        \n";
+    lout << "==========================================\n";
+    lout << "Type 'help' for commands.\n";
+    lout << "Type 'log on' to see disk operations.\n\n";
     
     if (argc > 1) {
         string arg = argv[1];
@@ -3170,24 +3141,27 @@ int main(int argc, char** argv) {
         } else if (arg.length() == 1 && isalpha(arg[0])) {
             if (!fs.mount(toupper(arg[0]))) return 1;
         } else {
-            cout << "Error: Invalid argument '" << arg << "'. Use a drive letter (e.g., D) or 'auto'.\n";
+            lout << "Error: Invalid argument '" << arg << "'. Use a drive letter (e.g., D) or 'auto'.\n";
             return 1;
         }
     } else {
-        cout << "Usage: mount.exe <DriveLetter|auto>\n";
+        lout << "Usage: mount.exe <DriveLetter|auto>\n";
         return 1;
     }
 
     while (true) {
+        lout << "\n";
         try {
             if (fs.isMounted()) {
-                cout << "fs:" << fs.getCurrentPath() << ":" << fs.getCurrentVersion() << "$ " << flush;
+                lout << "fs:" << fs.getCurrentPath() << ":" << fs.getCurrentVersion() << "$ " << flush;
             } else {
-                cout << "fs> " << flush;
+                lout << "fs> " << flush;
             }
             
             if (!getline(cin, input)) break;
             if (input.empty()) continue;
+
+        lout << "\n";
 
             stringstream ss(input);
             string cmd;
@@ -3201,65 +3175,16 @@ int main(int argc, char** argv) {
                 } else if (arg.length() == 1 && isalpha(arg[0])) {
                     fs.mount(toupper(arg[0]));
                 } else if (arg.empty()) {
-                    cout << "Usage: mount <DriveLetter|auto>\n";
+                    lout << "Usage: mount <DriveLetter|auto>\n";
                 } else {
-                    cout << "Error: Invalid argument '" << arg << "'. Use a drive letter (e.g., D) or 'auto'.\n";
+                    lout << "Error: Invalid argument '" << arg << "'. Use a drive letter (e.g., D) or 'auto'.\n";
                 }
             }
             else if (cmd == "log") {
                 string state; ss >> state;
                 if (state == "on") fs.setVerbose(true);
                 else if (state == "off") fs.setVerbose(false);
-                else cout << "Usage: log <on|off>\n";
-            }
-            else if (cmd == "cache") {
-                string sub; ss >> sub;
-                if (sub == "on") {
-                    fs.enableDiskCache(true);
-                    cout << "Cache ENABLED.\n";
-                } else if (sub == "off") {
-                    fs.enableDiskCache(false);
-                    cout << "Cache DISABLED.\n";
-                } else if (sub == "clear") {
-                    fs.clearDiskCache();
-                    cout << "Cache cleared.\n";
-                } else if (sub == "stats") {
-                    fs.showCacheStats();
-                } else {
-                    cout << "Usage: cache <on|off|clear|stats>\n";
-                }
-            }
-            else if (cmd == "lock") {
-                string sub, file;
-                ss >> sub >> file;
-                if (sub == "file" && !file.empty()) {
-                    if (fs.lockFile(file, true)) {
-                        cout << "Acquired EXCLUSIVE lock on '" << file << "'.\n";
-                    } else {
-                        cout << "Failed to acquire lock.\n";
-                    }
-                } else if (sub == "share" && !file.empty()) {
-                    if (fs.lockFile(file, false)) {
-                        cout << "Acquired SHARED lock on '" << file << "'.\n";
-                    } else {
-                        cout << "Failed to acquire lock.\n";
-                    }
-                } else {
-                    cout << "Usage: lock <file|share> <filename>\n";
-                }
-            }
-            else if (cmd == "unlock") {
-                string file; ss >> file;
-                if (file.empty()) {
-                    cout << "Usage: unlock <filename>\n";
-                } else if (fs.unlockFile(file)) {
-                    cout << "Released lock on '" << file << "'.\n";
-                } else {
-                    cout << "No lock held on '" << file << "'.\n";
-                }
-            }
-            else if (cmd == "locks") {
-                fs.showLocks();
+                else lout << "Usage: log <on|off>\n";
             }
             else if (cmd == "look") {
                 string arg; ss >> arg;
@@ -3274,7 +3199,7 @@ int main(int argc, char** argv) {
                 string option, path;
                 ss >> option >> path;
                 if (option.empty() || path.empty()) {
-                    cout << "Usage: perms <+r|-r|+w|-w|+x|-x> <path>\n";
+                    lout << "Usage: perms <+r|-r|+w|-w|+x|-x> <path>\n";
                 } else {
                     fs.perms(option, path);
                 }
@@ -3313,29 +3238,29 @@ int main(int argc, char** argv) {
                 if (sub == "add") {
                     ss >> arg1 >> arg2;
                     if (!arg1.empty() && !arg2.empty()) fs.levelAdd(arg1, arg2);
-                    else cout << "Usage: level add <folder|.> <levelname>\n";
+                    else lout << "Usage: level add <folder|.> <levelname>\n";
                 }
                 else if (sub == "branch") {
                     ss >> arg1 >> arg2 >> arg3;
                     if (!arg1.empty() && !arg2.empty() && !arg3.empty()) fs.levelBranch(arg1, arg2, arg3);
-                    else cout << "Usage: level branch <folder|.> <parent_level> <new_level>\n";
+                    else lout << "Usage: level branch <folder|.> <parent_level> <new_level>\n";
                 }
                 else if (sub == "remove") {
                     ss >> arg1 >> arg2;
                     if (!arg1.empty() && !arg2.empty()) fs.levelRemove(arg1, arg2);
-                    else cout << "Usage: level remove <folder|.> <levelname>\n";
+                    else lout << "Usage: level remove <folder|.> <levelname>\n";
                 }
                 else if (sub == "rename") {
                     ss >> arg1 >> arg2 >> arg3;
                     if (!arg1.empty() && !arg2.empty() && !arg3.empty()) fs.levelRename(arg1, arg2, arg3);
-                    else cout << "Usage: level rename <folder|.> <old> <new>\n";
+                    else lout << "Usage: level rename <folder|.> <old> <new>\n";
                 }
             }
             else if (cmd == "link") {
                 string dir1, dir2, levelName;
                 ss >> dir1 >> dir2 >> levelName;
                 if (dir1.empty() || dir2.empty() || levelName.empty()) {
-                    cout << "Usage: link <dir1> <dir2> <shared_level_name>\n";
+                    lout << "Usage: link <dir1> <dir2> <shared_level_name>\n";
                 } else {
                     fs.linkLevel(dir1, dir2, levelName);
                 }
@@ -3344,7 +3269,7 @@ int main(int argc, char** argv) {
                 string path, levelIdStr;
                 ss >> path >> levelIdStr;
                 if (path.empty() || levelIdStr.empty()) {
-                    cout << "Usage: mount-level <path> <levelID>\n";
+                    lout << "Usage: mount-level <path> <levelID>\n";
                 } else {
                     fs.createLevelMount(path, stoull(levelIdStr));
                 }
@@ -3354,13 +3279,13 @@ int main(int argc, char** argv) {
             else if (cmd == "symlink") {
                 string target, link;
                 ss >> target >> link;
-                if (target.empty() || link.empty()) cout << "Usage: symlink <target> <linkname>\n";
+                if (target.empty() || link.empty()) lout << "Usage: symlink <target> <linkname>\n";
                 else fs.createSymlink(link, target);
             }
             else if (cmd == "hardlink") {
                 string target, link;
                 ss >> target >> link;
-                if (target.empty() || link.empty()) cout << "Usage: hardlink <target> <linkname>\n";
+                if (target.empty() || link.empty()) lout << "Usage: hardlink <target> <linkname>\n";
                 else fs.createHardlink(link, target);
             }
             else if (cmd == "write") {
@@ -3368,63 +3293,59 @@ int main(int argc, char** argv) {
                 ss >> sub;
                 if (sub == "insert") {
                     ss >> file;
-                    if (file.empty()) cout << "Usage: write insert <filename>\n";
+                    if (file.empty()) lout << "Usage: write insert <filename>\n";
                     else fs.writeInsert(file);
                 } else if (!sub.empty()) {
                     fs.write(sub);
                 } else {
-                    cout << "Usage: write <filename> or write insert <filename>\n";
+                    lout << "Usage: write <filename> or write insert <filename>\n";
                 }
             }
             else if (cmd == "rename") {
                 string path, newName;
                 ss >> path >> newName;
                 if (path.empty() || newName.empty()) {
-                    cout << "Usage: rename <path|folder:level> <newname>\n";
+                    lout << "Usage: rename <path|folder:level> <newname>\n";
                 } else {
                     fs.rename(path, newName);
                 }
             }
             else if (cmd == "help") {
-                cout << "Commands:\n";
-                cout << "  mount <D|auto> - Mount drive letter or auto-scan\n";
-                cout << "  log <on|off>  - Toggle disk op logging\n";
-                cout << "  cache <on|off|clear|stats> - Cache control\n";
-                cout << "  lock <file|share> <name> - Lock file (exclusive/shared)\n";
-                cout << "  unlock <name> - Release lock\n";
-                cout << "  locks         - Show active locks\n";
-                cout << "  look          - List directory contents\n";
-                cout << "  look <folder> - List levels of a folder\n";
-                cout << "  look <f>:<l>  - List contents of folder:level\n";
-                cout << "  look -d [path]- Detailed view (size, perms, time)\n";
-                cout << "  dir-tree      - Display directory tree\n";
-                cout << "  current       - Show current path and level\n";
-                cout << "  levels        - List all levels in registry\n";
-                cout << "  create folder <n> - Create folder\n";
-                cout << "  create file <n> [ext] - Create file (e.g. readme txt)\n";
-                cout << "  write <name>  - Text editor for file\n";
-                cout << "  write insert <name> - Insert line at position (arrow keys)\n";
-                cout << "  read <name>   - Read file contents\n";
-                cout << "  rename <path> <newname> - Rename file/folder/level\n";
-                cout << "  perms <+/-rwx> <file> - Set permissions (+r,-w,+x...)\n";
-                cout << "  symlink <target> <link> - Create symbolic link\n";
-                cout << "  hardlink <target> <link> - Create hard link\n";
-                cout << "  mount-level <path> <id> - Mount level by ID at path\n";
-                cout << "  nav <path>    - Navigate to folder\n";
-                cout << "  del <name>    - Delete entry (links preserved)\n";
-                cout << "  move <s> <d>  - Move/rename entry\n";
-                cout << "  level add <f> <n>    - Add level to folder/.\n";
-                cout << "  level branch <f> <p> <n> - Branch level from parent\n";
-                cout << "  level remove <f> <n> - Remove level from folder/.\n";
-                cout << "  link <dir1> <dir2> <level> - Create shared level (DAG)\n";
-                cout << "  fsck          - Check filesystem integrity\n";
-                cout << "  fraginfo      - Show fragmentation info\n";
-                cout << "  defrag [-nvfr] - Defragment disk\n";
-                cout << "                  -n/--dry-run: analyze only\n";
-                cout << "                  -v/--verbose: detailed output\n";
-                cout << "                  -f/--force: force processing\n";
-                cout << "                  -r/--recursive: include subdirs\n";
-                cout << "  exit          - Exit\n";
+                lout << "Commands:\n";
+                lout << "  mount <D|auto> - Mount drive letter or auto-scan\n";
+                lout << "  log <on|off>  - Toggle disk op logging\n";
+                lout << "  look          - List directory contents\n";
+                lout << "  look <folder> - List levels of a folder\n";
+                lout << "  look <f>:<l>  - List contents of folder:level\n";
+                lout << "  look -d [path]- Detailed view (size, perms, time)\n";
+                lout << "  dir-tree      - Display directory tree\n";
+                lout << "  current       - Show current path and level\n";
+                lout << "  levels        - List all levels in registry\n";
+                lout << "  create folder <n> - Create folder\n";
+                lout << "  create file <n> [ext] - Create file (e.g. readme txt)\n";
+                lout << "  write <name>  - Text editor for file\n";
+                lout << "  write insert <name> - Insert line at position (arrow keys)\n";
+                lout << "  read <name>   - Read file contents\n";
+                lout << "  rename <path> <newname> - Rename file/folder/level\n";
+                lout << "  perms <+/-rwx> <file> - Set permissions (+r,-w,+x...)\n";
+                lout << "  symlink <target> <link> - Create symbolic link\n";
+                lout << "  hardlink <target> <link> - Create hard link\n";
+                lout << "  mount-level <path> <id> - Mount level by ID at path\n";
+                lout << "  nav <path>    - Navigate to folder\n";
+                lout << "  del <name>    - Delete entry (links preserved)\n";
+                lout << "  move <s> <d>  - Move/rename entry\n";
+                lout << "  level add <f> <n>    - Add level to folder/.\n";
+                lout << "  level branch <f> <p> <n> - Branch level from parent\n";
+                lout << "  level remove <f> <n> - Remove level from folder/.\n";
+                lout << "  link <dir1> <dir2> <level> - Create shared level (DAG)\n";
+                lout << "  fsck          - Check filesystem integrity\n";
+                lout << "  fraginfo      - Show fragmentation info\n";
+                lout << "  defrag [-nvfr] - Defragment disk\n";
+                lout << "                  -n/--dry-run: analyze only\n";
+                lout << "                  -v/--verbose: detailed output\n";
+                lout << "                  -f/--force: force processing\n";
+                lout << "                  -r/--recursive: include subdirs\n";
+                lout << "  exit          - Exit\n";
             }
             else if (cmd == "fsck") fs.fsck();
             else if (cmd == "fraginfo") fs.fragInfo();
@@ -3434,11 +3355,11 @@ int main(int argc, char** argv) {
                 if (flags.empty()) fs.defrag();
                 else fs.defragWithFlags(flags);
             }
-            else cout << "Unknown command. Type 'help' for list.\n";
+            else lout << "Unknown command. Type 'help' for list.\n";
         } catch (const exception& e) {
-            cout << "Error: " << e.what() << "\n";
+            lout << "Error: " << e.what() << "\n";
         } catch (...) {
-            cout << "Unknown error occurred.\n";
+            lout << "Unknown error occurred.\n";
         }
     }
     return 0;
