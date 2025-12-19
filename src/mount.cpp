@@ -401,8 +401,77 @@ public:
         setLABEntry(cluster, entry);
     }
     
+    void updateLITAllocatedCount(uint64_t cluster, int delta) {
+        uint64_t litIndex = cluster / CLUSTERS_PER_LIT_ENTRY;
+        uint64_t litClusterIdx = litIndex / LIT_ENTRIES_PER_CLUSTER;
+        uint64_t litEntryIdx = litIndex % LIT_ENTRIES_PER_CLUSTER;
+        
+        if (litClusterIdx >= sb.litClusters) return;
+        
+        char* litBuffer = new char[CLUSTER_SIZE];
+        for (int s = 0; s < SECTORS_PER_CLUSTER; s++) {
+            disk.readSector((sb.litStartCluster + litClusterIdx) * SECTORS_PER_CLUSTER + s,
+                litBuffer + s * SECTOR_SIZE);
+        }
+        LITEntry* litEntries = (LITEntry*)litBuffer;
+        
+        if (litEntries[litEntryIdx].labCluster != 0) {
+            if (delta > 0) {
+                litEntries[litEntryIdx].allocatedCount += delta;
+            } else if (litEntries[litEntryIdx].allocatedCount >= (uint32_t)(-delta)) {
+                litEntries[litEntryIdx].allocatedCount += delta;
+            }
+            
+            for (int s = 0; s < SECTORS_PER_CLUSTER; s++) {
+                disk.writeSector((sb.litStartCluster + litClusterIdx) * SECTORS_PER_CLUSTER + s,
+                    litBuffer + s * SECTOR_SIZE);
+            }
+        }
+        delete[] litBuffer;
+    }
+    
+    void updateLevelStats(uint64_t levelID, int64_t sizeDelta, int childDelta) {
+        if (sb.levelRegistryCluster == 0) return;
+        
+        vector<uint64_t> chain = getChain(sb.levelRegistryCluster);
+        for (uint64_t c : chain) {
+            char registryBuf[CLUSTER_SIZE];
+            for (int s = 0; s < SECTORS_PER_CLUSTER; s++) {
+                disk.readSector(c * SECTORS_PER_CLUSTER + s, registryBuf + s * SECTOR_SIZE);
+            }
+            LevelDescriptor* registry = (LevelDescriptor*)registryBuf;
+            
+            for (int j = 0; j < CLUSTER_SIZE / sizeof(LevelDescriptor); j++) {
+                if (registry[j].levelID == levelID && (registry[j].flags & LEVEL_FLAG_ACTIVE)) {
+                    if (sizeDelta != 0) {
+                        if (sizeDelta > 0) {
+                            registry[j].totalSize += sizeDelta;
+                        } else if (registry[j].totalSize >= (uint64_t)(-sizeDelta)) {
+                            registry[j].totalSize += sizeDelta;
+                        }
+                    }
+                    if (childDelta != 0) {
+                        if (childDelta > 0) {
+                            registry[j].childCount += childDelta;
+                        } else if (registry[j].childCount >= (uint64_t)(-childDelta)) {
+                            registry[j].childCount += childDelta;
+                        }
+                    }
+                    registry[j].modTime = time(0);
+                    
+                    for (int s = 0; s < SECTORS_PER_CLUSTER; s++) {
+                        disk.writeSector(c * SECTORS_PER_CLUSTER + s, registryBuf + s * SECTOR_SIZE);
+                    }
+                    return;
+                }
+            }
+        }
+    }
+    
     void freeCluster(uint64_t cluster) {
         if (cluster == 0 || isReservedCluster(cluster)) return;
+        
+        updateLITAllocatedCount(cluster, -1);
         
         LABEntry entry;
         entry.nextCluster = LAT_FREE;
@@ -420,6 +489,7 @@ public:
         
         vector<uint64_t> chain = getChain(startCluster);
         for (uint64_t c : chain) {
+            updateLITAllocatedCount(c, -1);
             LABEntry entry;
             entry.nextCluster = LAT_FREE;
             entry.levelID = LEVEL_ID_NONE;
@@ -474,6 +544,7 @@ public:
                 LABEntry entry = getLABEntry(c);
                 if (entry.nextCluster == LAT_FREE && entry.flags == 0) {
                     setLATEntryWithLevel(c, LAT_END, levelID);
+                    updateLITAllocatedCount(c, 1);
                     sb.freeClusterHint = c + 1;
                     sb.totalFreeClusters--;
                     writeSuperBlock();
@@ -1255,6 +1326,8 @@ found_slot:
         }
         
         disk.writeSector(targetCluster * 8 + freeSector, entries);
+        
+        updateLevelStats(context.currentLevelID, target->size, 1);
         
         string displayName = name;
         if (!extension.empty()) displayName += "." + extension;
@@ -2472,8 +2545,10 @@ level_check_done:
                             return;
                         }
                         
+                        // Acquire exclusive lock for deletion
+                        ScopedFileLock deleteLock(lockManager, entries[j].startCluster, path, LFS_LOCK_EXCLUSIVE, 5000);
                         if (entries[j].type == TYPE_FILE && entries[j].startCluster != 0) {
-                            if (lockManager.isFileLocked(entries[j].startCluster, LFS_LOCK_SHARED)) {
+                            if (!deleteLock.isHeld()) {
                                 lout << "Cannot delete: file is locked by another operation.\n";
                                 return;
                             }
@@ -2516,6 +2591,8 @@ level_check_done:
                                 freeChain(entries[j].startCluster);
                             }
                         }
+                        
+                        updateLevelStats(context.currentLevelID, -((int64_t)entries[j].size), -1);
                         
                         entries[j].type = TYPE_FREE;
                         memset(&entries[j], 0, sizeof(DirEntry));
@@ -2573,8 +2650,10 @@ level_check_done:
                 disk.readSector(c * 8 + i, entries);
                 for (int j=0; j<SECTOR_SIZE/sizeof(DirEntry); j++) {
                     if (entries[j].type != TYPE_FREE && string(entries[j].name) == srcRes.name) {
+                        // Acquire exclusive lock for move operation
+                        ScopedFileLock moveLock(lockManager, entries[j].startCluster, srcPath, LFS_LOCK_EXCLUSIVE, 5000);
                         if (entries[j].type == TYPE_FILE && entries[j].startCluster != 0) {
-                            if (lockManager.isFileLocked(entries[j].startCluster, LFS_LOCK_SHARED)) {
+                            if (!moveLock.isHeld()) {
                                 lout << "Cannot move: file is in use.\n";
                                 return;
                             }
@@ -2697,8 +2776,10 @@ found_src:
                             return;
                         }
                         
+                        // Acquire exclusive lock for rename operation
+                        ScopedFileLock renameLock(lockManager, entries[j].startCluster, path, LFS_LOCK_EXCLUSIVE, 5000);
                         if (entries[j].type == TYPE_FILE && entries[j].startCluster != 0) {
-                            if (lockManager.isFileLocked(entries[j].startCluster, LFS_LOCK_SHARED)) {
+                            if (!renameLock.isHeld()) {
                                 lout << "Cannot rename: file is in use.\n";
                                 return;
                             }
