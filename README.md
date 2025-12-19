@@ -86,4 +86,4 @@ sudo ./fs format    # Interactive disk selection
 
 ## License
 
-MIT License
+Apache License 2.0

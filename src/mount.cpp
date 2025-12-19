@@ -11,6 +11,9 @@
 #include "defrag.hpp"
 #include "concurrent.hpp"
 #include "lstream.hpp"
+#include "vfs-src/vfs_interface.hpp"
+#include "vfs-src/vfs_platform.hpp"
+#include "vfs-src/levelfs_vfs.hpp"
 
 class FileSystemShell {
     DiskDevice disk;
@@ -175,8 +178,103 @@ public:
             testDisk.close();
         }
         
+        lout << "No drive letter volumes found. Scanning physical disks...\n";
+        for (int diskNum = 0; diskNum <= 9; diskNum++) {
+            string diskPath = "\\\\.\\PhysicalDrive" + to_string(diskNum);
+            
+            static const uint64_t partitionOffsets[] = {
+                0,              // Whole-disk format
+                2048,           // GPT partition (1MB offset)
+                63,             // Legacy MBR partition
+                128,            // Some USB drives
+            };
+            
+            for (uint64_t offsetSectors : partitionOffsets) {
+                uint64_t offsetBytes = offsetSectors * SECTOR_SIZE;
+                
+                DiskDevice testDisk;
+                if (!testDisk.open(diskPath, offsetBytes)) continue;
+                
+                SuperBlock testSb;
+                if (!testDisk.readSector(0, &testSb)) {
+                    testDisk.close();
+                    continue;
+                }
+                
+                if (testSb.magic == MAGIC) {
+                    testDisk.close();
+                    lout << "Found LevelFS on " << diskPath << " at offset " << offsetBytes << " bytes\n";
+                    return mountPhysicalWithOffset(diskPath, offsetBytes);
+                }
+                
+                testDisk.close();
+            }
+        }
+        
         lout << "No LevelFS disk found.\n";
         return false;
+    }
+
+    bool mountPhysical(const string& diskPath) {
+        return mountPhysicalWithOffset(diskPath, 0);
+    }
+
+    bool mountPhysicalWithOffset(const string& diskPath, uint64_t offsetBytes) {
+        if (!disk.open(diskPath, offsetBytes)) {
+            lout << "Failed to open " << diskPath << " at offset " << offsetBytes << "\n";
+            return false;
+        }
+        
+        if (!disk.readSector(0, &sb)) {
+            lout << "Failed to read superblock.\n";
+            disk.close();
+            return false;
+        }
+        if (sb.magic != MAGIC) {
+            if (!tryBackupSuperblock()) {
+                lout << "Invalid magic: " << hex << sb.magic << dec << "\n";
+                disk.close();
+                return false;
+            }
+        }
+
+        journal = new Journal(&disk, &sb);
+        journal->replayJournal();
+
+        context.currentDirCluster = sb.rootDirCluster;
+        context.currentPath = "/";
+        context.rootLevelID = sb.rootLevelID;
+        context.currentFolderPerms = PERM_ROOT_DEFAULT;
+        
+        if (entryReader) delete entryReader;
+        if (entryWriter) delete entryWriter;
+        if (entryFinder) delete entryFinder;
+        entryReader = new EntryReader(disk);
+        entryWriter = new EntryWriter(disk);
+        entryFinder = new EntryFinder(disk);
+        permCache.clear();
+        
+        if(loadVersion("master")) {
+            context.rootContentCluster = context.currentContentCluster;
+            context.rootVersion = "master";
+        } else {
+            context.rootContentCluster = 0;
+        }
+        
+        lout << "=== Leveled File System v2 ===\n";
+        lout << "  Volume: " << sb.volumeName << "\n";
+        lout << "  Source: " << diskPath << "\n";
+        if (offsetBytes > 0) {
+            lout << "  Partition Offset: " << offsetBytes << " bytes\n";
+        }
+        lout << "  Total Clusters: " << sb.totalClusters << "\n";
+        lout << "  Free Clusters: " << sb.totalFreeClusters << "\n";
+        lout << "  Root Level: " << context.rootVersion << "\n";
+        
+        if (permResolver) delete permResolver;
+        permResolver = new PermissionResolver(disk, permCache, context.rootContentCluster);
+        
+        return true;
     }
 
     bool mountImage(const string& path) {
@@ -602,6 +700,150 @@ public:
     }
 
     bool isMounted() { return disk.isOpen(); }
+
+    struct InternalPathResult {
+        uint64_t parentCluster;
+        uint64_t targetCluster;
+        string name;
+        uint8_t type;
+        uint64_t size;
+        uint32_t attrs;
+        uint32_t mtime;
+        LfsError error;
+    };
+
+    InternalPathResult resolvePathInternal(const string& path) {
+        InternalPathResult result;
+        result.parentCluster = 0;
+        result.targetCluster = 0;
+        result.type = TYPE_FREE;
+        result.size = 0;
+        result.attrs = 0;
+        result.mtime = 0;
+        result.error = LFS_ENOENT;
+
+        if (!disk.isOpen()) { result.error = LFS_ENOTMOUNTED; return result; }
+
+        if (path.empty() || path == "/") {
+            result.parentCluster = context.rootContentCluster;
+            result.targetCluster = context.rootContentCluster;
+            result.type = TYPE_LEVELED_DIR;
+            result.attrs = PERM_ROOT_DEFAULT;
+            result.error = LFS_OK;
+            return result;
+        }
+
+        PathResult res = resolvePath(path);
+        if (!res.valid) return result;
+
+        vector<DirEntry> entries = readDirEntries(res.parentCluster);
+        for (const auto& e : entries) {
+            if (string(e.name) == res.name) {
+                result.parentCluster = res.parentCluster;
+                result.targetCluster = e.startCluster;
+                result.name = res.name;
+                result.type = e.type;
+                result.size = e.size;
+                result.attrs = e.attributes;
+                result.mtime = e.modTime;
+                result.error = LFS_OK;
+                return result;
+            }
+        }
+        return result;
+    }
+
+    LfsError readInternal(const string& path, vector<uint8_t>& outData, uint64_t offset = 0, size_t maxSize = SIZE_MAX) {
+        if (!disk.isOpen()) return LFS_ENOTMOUNTED;
+
+        InternalPathResult info = resolvePathInternal(path);
+        if (info.error != LFS_OK) return info.error;
+        if (info.type == TYPE_LEVELED_DIR) return LFS_EISDIR;
+        if (!(info.attrs & PERM_READ)) return LFS_EACCES;
+
+        uint64_t fileCluster = info.targetCluster;
+        uint64_t fileSize = info.size;
+
+        if (offset >= fileSize) { outData.clear(); return LFS_OK; }
+
+        size_t toRead = min(maxSize, (size_t)(fileSize - offset));
+        outData.resize(toRead);
+
+        vector<uint64_t> chain = getChain(fileCluster);
+        if (chain.empty()) return LFS_EIO;
+
+        uint64_t clusterIndex = offset / CLUSTER_SIZE;
+        uint64_t clusterOffset = offset % CLUSTER_SIZE;
+
+        size_t totalRead = 0;
+        for (size_t ci = clusterIndex; ci < chain.size() && totalRead < toRead; ci++) {
+            char clusterBuf[CLUSTER_SIZE];
+            for (int s = 0; s < SECTORS_PER_CLUSTER; s++) {
+                disk.readSector(chain[ci] * SECTORS_PER_CLUSTER + s, clusterBuf + s * SECTOR_SIZE);
+            }
+            size_t copyStart = (ci == clusterIndex) ? clusterOffset : 0;
+            size_t copyLen = min((size_t)(CLUSTER_SIZE - copyStart), toRead - totalRead);
+            memcpy(outData.data() + totalRead, clusterBuf + copyStart, copyLen);
+            totalRead += copyLen;
+        }
+        outData.resize(totalRead);
+        return LFS_OK;
+    }
+
+    LfsError getattrInternal(const string& path, LfsStat* st) {
+        if (!disk.isOpen()) return LFS_ENOTMOUNTED;
+        if (!st) return LFS_EINVAL;
+
+        InternalPathResult info = resolvePathInternal(path);
+        if (info.error != LFS_OK) return info.error;
+
+        memset(st, 0, sizeof(LfsStat));
+        st->ino = info.targetCluster;
+        st->size = info.size;
+        st->blksize = CLUSTER_SIZE;
+        st->blocks = (info.size + CLUSTER_SIZE - 1) / CLUSTER_SIZE;
+        st->mtime = info.mtime;
+        st->atime = info.mtime;
+        st->ctime = info.mtime;
+        st->nlink = 1;
+
+        if (info.type == TYPE_LEVELED_DIR) {
+            st->mode = LFS_S_IFDIR | LFS_S_IRUSR | LFS_S_IWUSR | LFS_S_IXUSR;
+        } else if (info.type == TYPE_SYMLINK) {
+            st->mode = LFS_S_IFLNK | LFS_S_IRUSR | LFS_S_IWUSR | LFS_S_IXUSR;
+        } else {
+            st->mode = LFS_S_IFREG;
+            if (info.attrs & PERM_READ) st->mode |= LFS_S_IRUSR | LFS_S_IRGRP | LFS_S_IROTH;
+            if (info.attrs & PERM_WRITE) st->mode |= LFS_S_IWUSR;
+            if (info.attrs & PERM_EXEC) st->mode |= LFS_S_IXUSR | LFS_S_IXGRP | LFS_S_IXOTH;
+        }
+        return LFS_OK;
+    }
+
+    LfsError readdirInternal(uint64_t contentCluster, vector<DirEntry>& entries) {
+        if (!disk.isOpen()) return LFS_ENOTMOUNTED;
+        entries = readDirEntries(contentCluster);
+        return LFS_OK;
+    }
+
+    LfsError statfsInternal(LfsStatFs* stfs) {
+        if (!disk.isOpen()) return LFS_ENOTMOUNTED;
+        if (!stfs) return LFS_EINVAL;
+
+        memset(stfs, 0, sizeof(LfsStatFs));
+        stfs->totalBlocks = sb.totalClusters;
+        stfs->freeBlocks = sb.totalFreeClusters;
+        stfs->availBlocks = sb.totalFreeClusters;
+        stfs->blockSize = CLUSTER_SIZE;
+        stfs->maxNameLen = 24;
+        strncpy(stfs->volumeName, sb.volumeName, sizeof(stfs->volumeName) - 1);
+        return LFS_OK;
+    }
+
+    DiskDevice& getDiskDevice() { return disk; }
+    SuperBlock& getSuperBlock() { return sb; }
+    NavigationContext& getNavigationContext() { return context; }
+    FileLockManager& getFileLockManager() { return lockManager; }
 
     bool loadVersion(const string& ver) {
         vector<uint64_t> chain = getChain(context.currentDirCluster);
@@ -3251,6 +3493,9 @@ int main(int argc, char** argv) {
         return 1;
     }
 
+    static IVfsPlatform* g_vfsPlatform = nullptr;
+    static LevelFSProvider* g_vfsProvider = nullptr;
+    
     while (true) {
         lout << "\n";
         try {
@@ -3280,6 +3525,56 @@ int main(int argc, char** argv) {
                     lout << "Usage: mount <DriveLetter|auto>\n";
                 } else {
                     lout << "Error: Invalid argument '" << arg << "'. Use a drive letter (e.g., D) or 'auto'.\n";
+                }
+            }
+            else if (cmd == "vfsmount") {
+                string driveLetter; ss >> driveLetter;
+                if (!fs.isMounted()) {
+                    lout << "Error: No LevelFS image mounted. Use 'mount' first.\n";
+                } else if (driveLetter.empty()) {
+                    lout << "Usage: vfsmount <DriveLetter>\n";
+                    lout << "  Example: vfsmount Z\n";
+                    lout << "  Mounts the current LevelFS image as a Windows drive.\n";
+                    lout << "  Requires WinFsp to be installed.\n";
+                } else {
+                    if (g_vfsPlatform && g_vfsPlatform->isMounted()) {
+                        lout << "VFS already mounted at " << g_vfsPlatform->getMountPoint() << "\n";
+                        lout << "Use 'vfsunmount' first.\n";
+                    } else {
+                        if (!g_vfsProvider) g_vfsProvider = new LevelFSProvider();
+                        if (!g_vfsPlatform) g_vfsPlatform = createWinFspPlatform();
+                        
+                        if (!g_vfsPlatform) {
+                            lout << "Error: WinFsp platform not available.\n";
+                        } else {
+                            g_vfsProvider->attach(&fs);
+                            
+                            VfsMountOptions opts;
+                            opts.mountPoint = string(1, toupper(driveLetter[0])) + ":";
+                            opts.volumeName = string(fs.getSuperBlock().volumeName);
+                            opts.sectorSize = SECTOR_SIZE;
+                            opts.sectorsPerCluster = SECTORS_PER_CLUSTER;
+                            
+                            int result = g_vfsPlatform->mount(opts, g_vfsProvider);
+                            if (result == 0) {
+                                lout << "VFS mounted at " << g_vfsPlatform->getMountPoint() << "\n";
+                                lout << "LevelFS is now accessible as a Windows drive.\n";
+                            } else {
+                                lout << "VFS mount failed: " << g_vfsPlatform->getLastErrorString() << "\n";
+                                g_vfsProvider->detach();
+                            }
+                        }
+                    }
+                }
+            }
+            else if (cmd == "vfsunmount") {
+                if (g_vfsPlatform && g_vfsPlatform->isMounted()) {
+                    string mp = g_vfsPlatform->getMountPoint();
+                    g_vfsPlatform->unmount();
+                    if (g_vfsProvider) g_vfsProvider->detach();
+                    lout << "VFS unmounted from " << mp << "\n";
+                } else {
+                    lout << "No VFS mount active.\n";
                 }
             }
             else if (cmd == "log") {
