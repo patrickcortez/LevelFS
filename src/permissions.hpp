@@ -129,6 +129,14 @@ public:
             return PermissionResult(0, false, "Disk not open");
         }
         
+        string searchName = entryName;
+        string searchExt = "";
+        size_t dotPos = entryName.find_last_of('.');
+        if (dotPos != string::npos && dotPos > 0) {
+            searchName = entryName.substr(0, dotPos);
+            searchExt = entryName.substr(dotPos + 1);
+        }
+        
         vector<uint64_t> chain;
         uint64_t current = parentCluster;
         int chainLimit = 1000;
@@ -161,11 +169,9 @@ public:
                 
                 for (int idx = 0; idx < SECTOR_SIZE / sizeof(DirEntry); idx++) {
                     if (entries[idx].type != TYPE_FREE) {
-                        char nameBuf[25];
-                        memcpy(nameBuf, entries[idx].name, 24);
-                        nameBuf[24] = '\0';
-                        
-                        if (string(nameBuf) == entryName) {
+                        bool nameMatch = (string(entries[idx].name) == searchName);
+                        bool extMatch = searchExt.empty() || (string(entries[idx].extension) == searchExt);
+                        if (nameMatch && extMatch) {
                             return PermissionResult(entries[idx].attributes, true, "");
                         }
                     }
@@ -194,13 +200,19 @@ public:
                     continue;
                 }
                 
+                string searchName = entryName;
+                string searchExt = "";
+                size_t dotPos = entryName.find_last_of('.');
+                if (dotPos != string::npos && dotPos > 0) {
+                    searchName = entryName.substr(0, dotPos);
+                    searchExt = entryName.substr(dotPos + 1);
+                }
+                
                 for (int idx = 0; idx < SECTOR_SIZE / sizeof(DirEntry); idx++) {
                     if (entries[idx].type != TYPE_FREE) {
-                        char nameBuf[25];
-                        memcpy(nameBuf, entries[idx].name, 24);
-                        nameBuf[24] = '\0';
-                        
-                        if (string(nameBuf) == entryName) {
+                        bool nameMatch = (string(entries[idx].name) == searchName);
+                        bool extMatch = searchExt.empty() || (string(entries[idx].extension) == searchExt);
+                        if (nameMatch && extMatch) {
                             entries[idx].attributes = newPerms;
                             entries[idx].modTime = time(nullptr);
                             

@@ -1,5 +1,5 @@
 /*
- * Compile: g++ mount.cpp -o mount.exe
+ * Compile: g++ -std=c++17 -static -static-libgcc -static-libstdc++ -pthread src/mount.cpp src/lstream.cpp -o bin/mount.exe 2>&1
  * Leveled File System Shell - Level-First Architecture
  */
 
@@ -11,15 +11,17 @@
 #include "defrag.hpp"
 #include "concurrent.hpp"
 #include "lstream.hpp"
-#include "vfs-src/vfs_interface.hpp"
-#include "vfs-src/vfs_platform.hpp"
-#include "vfs-src/levelfs_vfs.hpp"
+#include "utils/handler.hpp"
+#include "utils/handler.cpp"
 
 class FileSystemShell {
     DiskDevice disk;
     SuperBlock sb;
     Journal* journal;
     FileLockManager lockManager;
+    
+    ThreadPool threadPool;
+    TaskHandler taskHandler;
     
     PermissionCache permCache;
     EntryReader* entryReader;
@@ -29,6 +31,8 @@ class FileSystemShell {
     NavigationContext context;
     ContextManager* ctxManager;
     PermissionResolver* permResolver;
+    
+    map<string, string> variables;  // Variable storage for $var expansion
 
 public:
     FileSystemShell() : journal(nullptr), entryReader(nullptr), entryWriter(nullptr), entryFinder(nullptr), ctxManager(nullptr), permResolver(nullptr) {
@@ -147,6 +151,14 @@ public:
             
             if (permResolver) delete permResolver;
             permResolver = new PermissionResolver(disk, permCache, context.rootContentCluster);
+            
+            if (!isRootFSInitialized()) {
+                rootfsInit();
+            }
+            loadVariables();
+            
+            taskHandler.startOptimizer([this]() {
+            }, 60000);
         } else {
             lout << "No master version.\n";
             context.rootContentCluster = 0;
@@ -274,6 +286,11 @@ public:
         if (permResolver) delete permResolver;
         permResolver = new PermissionResolver(disk, permCache, context.rootContentCluster);
         
+        if (!isRootFSInitialized()) {
+            rootfsInit();
+        }
+        loadVariables();
+        
         return true;
     }
 
@@ -337,7 +354,13 @@ public:
         disk.writeSector(sb.rootDirCluster * 8, vpsBuf);
         loadVersion("master");
         context.rootContentCluster = context.currentContentCluster;
-    }    
+    }
+        
+        if (!isRootFSInitialized()) {
+            rootfsInit();
+        }
+        loadVariables();
+        
         return true;
     }
     
@@ -701,149 +724,19 @@ public:
 
     bool isMounted() { return disk.isOpen(); }
 
-    struct InternalPathResult {
-        uint64_t parentCluster;
-        uint64_t targetCluster;
-        string name;
-        uint8_t type;
-        uint64_t size;
-        uint32_t attrs;
-        uint32_t mtime;
-        LfsError error;
-    };
-
-    InternalPathResult resolvePathInternal(const string& path) {
-        InternalPathResult result;
-        result.parentCluster = 0;
-        result.targetCluster = 0;
-        result.type = TYPE_FREE;
-        result.size = 0;
-        result.attrs = 0;
-        result.mtime = 0;
-        result.error = LFS_ENOENT;
-
-        if (!disk.isOpen()) { result.error = LFS_ENOTMOUNTED; return result; }
-
-        if (path.empty() || path == "/") {
-            result.parentCluster = context.rootContentCluster;
-            result.targetCluster = context.rootContentCluster;
-            result.type = TYPE_LEVELED_DIR;
-            result.attrs = PERM_ROOT_DEFAULT;
-            result.error = LFS_OK;
-            return result;
-        }
-
-        PathResult res = resolvePath(path);
-        if (!res.valid) return result;
-
-        vector<DirEntry> entries = readDirEntries(res.parentCluster);
-        for (const auto& e : entries) {
-            if (string(e.name) == res.name) {
-                result.parentCluster = res.parentCluster;
-                result.targetCluster = e.startCluster;
-                result.name = res.name;
-                result.type = e.type;
-                result.size = e.size;
-                result.attrs = e.attributes;
-                result.mtime = e.modTime;
-                result.error = LFS_OK;
-                return result;
-            }
-        }
-        return result;
-    }
-
-    LfsError readInternal(const string& path, vector<uint8_t>& outData, uint64_t offset = 0, size_t maxSize = SIZE_MAX) {
-        if (!disk.isOpen()) return LFS_ENOTMOUNTED;
-
-        InternalPathResult info = resolvePathInternal(path);
-        if (info.error != LFS_OK) return info.error;
-        if (info.type == TYPE_LEVELED_DIR) return LFS_EISDIR;
-        if (!(info.attrs & PERM_READ)) return LFS_EACCES;
-
-        uint64_t fileCluster = info.targetCluster;
-        uint64_t fileSize = info.size;
-
-        if (offset >= fileSize) { outData.clear(); return LFS_OK; }
-
-        size_t toRead = min(maxSize, (size_t)(fileSize - offset));
-        outData.resize(toRead);
-
-        vector<uint64_t> chain = getChain(fileCluster);
-        if (chain.empty()) return LFS_EIO;
-
-        uint64_t clusterIndex = offset / CLUSTER_SIZE;
-        uint64_t clusterOffset = offset % CLUSTER_SIZE;
-
-        size_t totalRead = 0;
-        for (size_t ci = clusterIndex; ci < chain.size() && totalRead < toRead; ci++) {
-            char clusterBuf[CLUSTER_SIZE];
-            for (int s = 0; s < SECTORS_PER_CLUSTER; s++) {
-                disk.readSector(chain[ci] * SECTORS_PER_CLUSTER + s, clusterBuf + s * SECTOR_SIZE);
-            }
-            size_t copyStart = (ci == clusterIndex) ? clusterOffset : 0;
-            size_t copyLen = min((size_t)(CLUSTER_SIZE - copyStart), toRead - totalRead);
-            memcpy(outData.data() + totalRead, clusterBuf + copyStart, copyLen);
-            totalRead += copyLen;
-        }
-        outData.resize(totalRead);
-        return LFS_OK;
-    }
-
-    LfsError getattrInternal(const string& path, LfsStat* st) {
-        if (!disk.isOpen()) return LFS_ENOTMOUNTED;
-        if (!st) return LFS_EINVAL;
-
-        InternalPathResult info = resolvePathInternal(path);
-        if (info.error != LFS_OK) return info.error;
-
-        memset(st, 0, sizeof(LfsStat));
-        st->ino = info.targetCluster;
-        st->size = info.size;
-        st->blksize = CLUSTER_SIZE;
-        st->blocks = (info.size + CLUSTER_SIZE - 1) / CLUSTER_SIZE;
-        st->mtime = info.mtime;
-        st->atime = info.mtime;
-        st->ctime = info.mtime;
-        st->nlink = 1;
-
-        if (info.type == TYPE_LEVELED_DIR) {
-            st->mode = LFS_S_IFDIR | LFS_S_IRUSR | LFS_S_IWUSR | LFS_S_IXUSR;
-        } else if (info.type == TYPE_SYMLINK) {
-            st->mode = LFS_S_IFLNK | LFS_S_IRUSR | LFS_S_IWUSR | LFS_S_IXUSR;
-        } else {
-            st->mode = LFS_S_IFREG;
-            if (info.attrs & PERM_READ) st->mode |= LFS_S_IRUSR | LFS_S_IRGRP | LFS_S_IROTH;
-            if (info.attrs & PERM_WRITE) st->mode |= LFS_S_IWUSR;
-            if (info.attrs & PERM_EXEC) st->mode |= LFS_S_IXUSR | LFS_S_IXGRP | LFS_S_IXOTH;
-        }
-        return LFS_OK;
-    }
-
-    LfsError readdirInternal(uint64_t contentCluster, vector<DirEntry>& entries) {
-        if (!disk.isOpen()) return LFS_ENOTMOUNTED;
-        entries = readDirEntries(contentCluster);
-        return LFS_OK;
-    }
-
-    LfsError statfsInternal(LfsStatFs* stfs) {
-        if (!disk.isOpen()) return LFS_ENOTMOUNTED;
-        if (!stfs) return LFS_EINVAL;
-
-        memset(stfs, 0, sizeof(LfsStatFs));
-        stfs->totalBlocks = sb.totalClusters;
-        stfs->freeBlocks = sb.totalFreeClusters;
-        stfs->availBlocks = sb.totalFreeClusters;
-        stfs->blockSize = CLUSTER_SIZE;
-        stfs->maxNameLen = 24;
-        strncpy(stfs->volumeName, sb.volumeName, sizeof(stfs->volumeName) - 1);
-        return LFS_OK;
-    }
-
     DiskDevice& getDiskDevice() { return disk; }
     SuperBlock& getSuperBlock() { return sb; }
     NavigationContext& getNavigationContext() { return context; }
     FileLockManager& getFileLockManager() { return lockManager; }
+    ThreadPool& getThreadPool() { return threadPool; }
+    TaskHandler& getTaskHandler() { return taskHandler; }
+    
+    void listBackgroundTasks() { taskHandler.listTasks(); }
+    
+    uint32_t runInBackground(const string& taskName, function<void()> func) {
+        return taskHandler.runBackground(taskName, func);
+    }
+
 
     bool loadVersion(const string& ver) {
         vector<uint64_t> chain = getChain(context.currentDirCluster);
@@ -871,6 +764,41 @@ public:
         string name;
         bool valid;
     };
+    
+    struct FileParts {
+        string name;
+        string ext;
+    };
+    
+    FileParts parseFileName(const string& fullName) {
+        FileParts parts;
+        size_t dotPos = fullName.find_last_of('.');
+        if (dotPos != string::npos && dotPos > 0) {
+            parts.name = fullName.substr(0, dotPos);
+            parts.ext = fullName.substr(dotPos + 1);
+        } else {
+            parts.name = fullName;
+            parts.ext = "";
+        }
+        return parts;
+    }
+    
+    bool matchesFile(const DirEntry& entry, const FileParts& fp) {
+        if (entry.type != TYPE_FILE && entry.type != TYPE_SYMLINK && entry.type != TYPE_HARDLINK) return false;
+        bool nameMatch = (string(entry.name) == fp.name);
+        bool extMatch = fp.ext.empty() || (string(entry.extension) == fp.ext);
+        return nameMatch && extMatch;
+    }
+    
+    bool matchesEntry(const DirEntry& entry, const FileParts& fp) {
+        if (entry.type == TYPE_FREE) return false;
+        bool nameMatch = (string(entry.name) == fp.name);
+        if (entry.type == TYPE_LEVELED_DIR || entry.type == TYPE_LEVEL_MOUNT) {
+            return nameMatch && fp.ext.empty();
+        }
+        bool extMatch = fp.ext.empty() || (string(entry.extension) == fp.ext);
+        return nameMatch && extMatch;
+    }
 
     PathResult resolvePath(string path) {
         if (path.empty()) return {context.currentContentCluster, "", false};
@@ -1879,41 +1807,51 @@ found:
             lout << "  OK: " << levelCount << " active levels found.\n";
         }
         
-        // Check 4: Free space consistency
-        lout << "[4/5] Checking free space... ";
+        // Check 4: Free space consistency 
+        lout << "[4/5] Checking free space ... ";
         lout.flush();
         
         uint64_t reportedFree = sb.totalFreeClusters;
-        uint64_t sampleFree = 0;
-        uint64_t sampleCount = 0;
+        atomic<uint64_t> sampleFree(0);
+        atomic<uint64_t> sampleCount(0);
         
-        // Fast sampling: check every 100th cluster with spinner
         uint64_t dataStart = sb.labPoolStart + sb.labPoolClusters;
         uint64_t totalToCheck = min(sb.totalClusters - dataStart, (uint64_t)100000);
-        const char spinner[] = "|/-\\";
-        int spinIdx = 0;
         
-        for (uint64_t i = 0; i < totalToCheck; i += 100) {
-            uint64_t cluster = dataStart + i;
-            if (cluster >= sb.totalClusters) break;
+        size_t numWorkers = threadPool.getWorkerCount();
+        size_t samplesPerWorker = (totalToCheck / 100 + numWorkers - 1) / numWorkers;
+        
+        vector<future<pair<uint64_t, uint64_t>>> futures;
+        
+        for (size_t w = 0; w < numWorkers; w++) {
+            size_t startSample = w * samplesPerWorker;
+            size_t endSample = min(startSample + samplesPerWorker, totalToCheck / 100);
             
-            LABEntry lab = getLABEntry(cluster);
-            if (lab.nextCluster == LAT_FREE) sampleFree++;
-            sampleCount++;
-            
-            // Update spinner every 1000 samples
-            if (sampleCount % 10 == 0) {
-                lout << "\b" << spinner[spinIdx++ % 4];
-                lout.flush();
-            }
+            futures.push_back(threadPool.enqueue([this, dataStart, startSample, endSample]() {
+                uint64_t localFree = 0;
+                uint64_t localCount = 0;
+                for (size_t i = startSample; i < endSample; i++) {
+                    uint64_t cluster = dataStart + i * 100;
+                    if (cluster >= sb.totalClusters) break;
+                    LABEntry lab = getLABEntry(cluster);
+                    if (lab.nextCluster == LAT_FREE) localFree++;
+                    localCount++;
+                }
+                return make_pair(localFree, localCount);
+            }));
         }
         
-        lout << "\b \n";  // Clear spinner
+        for (auto& f : futures) {
+            auto result = f.get();
+            sampleFree += result.first;
+            sampleCount += result.second;
+        }
         
-        // Estimate total free from sample
+        lout << "done\n";
+        
         if (sampleCount > 0 && sampleFree > 0) {
-            uint64_t estimatedFree = (sampleFree * 100);  // Scale up from sampling
-            lout << "  OK: ~" << estimatedFree << " free clusters (sampled).\n";
+            uint64_t estimatedFree = (sampleFree * 100);
+            lout << "  OK: ~" << estimatedFree << " free clusters (parallel sampled).\n";
         } else if (reportedFree > 0) {
             lout << "  OK: " << reportedFree << " free clusters (from superblock).\n";
         } else {
@@ -2556,10 +2494,10 @@ found_parent:
         bool found = false;
         DirEntry fileEntry;
         uint64_t fileCluster = 0;
+        FileParts fp = parseFileName(res.name);
         
         for (const auto& e : entries) {
-            if ((e.type == TYPE_FILE || e.type == TYPE_SYMLINK || e.type ==TYPE_HARDLINK) && 
-                string(e.name) == res.name) {
+            if (matchesFile(e, fp)) {
                 fileEntry = e;
                 fileCluster = e.startCluster;
                 found = true;
@@ -2746,6 +2684,7 @@ level_check_done:
         DirEntry entries[SECTOR_SIZE/sizeof(DirEntry)];
         uint64_t foundCluster = 0;
         int foundSector = -1, foundIdx = -1;
+        FileParts fp = parseFileName(res.name);
         
         // Follow LAT chain for deletion search
         vector<uint64_t> chain = getChain(res.parentCluster);
@@ -2753,7 +2692,7 @@ level_check_done:
             for (int i=0; i<8; i++) {
                 disk.readSector(c * 8 + i, entries);
                 for (int j=0; j<SECTOR_SIZE/sizeof(DirEntry); j++) {
-                    if (entries[j].type != TYPE_FREE && string(entries[j].name) == res.name) {
+                    if (matchesEntry(entries[j], fp)) {
                         if (entries[j].type == TYPE_LEVELED_DIR && !recursive) {
                              char vpsBuf[SECTOR_SIZE];
                              VersionEntry* vps = (VersionEntry*)vpsBuf;
@@ -3461,9 +3400,610 @@ found_file:
         lout << "\n";
     }
     
+    void importFile(const string& hostPath, string lfsName = "") {
+        if (!disk.isOpen()) { lout << "Not mounted.\n"; return; }
+        
+        if (!(context.currentFolderPerms & PERM_WRITE)) {
+            lout << "Permission denied: current folder is read-only.\n";
+            return;
+        }
+        
+        string cleanPath = hostPath;
+        if (cleanPath.size() >= 2 && cleanPath.front() == '"' && cleanPath.back() == '"') {
+            cleanPath = cleanPath.substr(1, cleanPath.size() - 2);
+        }
+        
+        FILE* hostFile = fopen(cleanPath.c_str(), "rb");
+        if (!hostFile) {
+            lout << "Cannot open host file: " << hostPath << "\n";
+            return;
+        }
+        
+        fseek(hostFile, 0, SEEK_END);
+        uint64_t fileSize = ftell(hostFile);
+        fseek(hostFile, 0, SEEK_SET);
+        
+        if (lfsName.empty()) {
+            size_t lastSlash = hostPath.find_last_of("\\/");
+            lfsName = (lastSlash != string::npos) ? hostPath.substr(lastSlash + 1) : hostPath;
+        }
+        
+        string name = lfsName;
+        string ext = "";
+        size_t dotPos = lfsName.find_last_of('.');
+        if (dotPos != string::npos && dotPos > 0) {
+            name = lfsName.substr(0, dotPos);
+            ext = lfsName.substr(dotPos + 1);
+        }
+        
+        if (name.length() > 23) name = name.substr(0, 23);
+        if (ext.length() > 3) ext = ext.substr(0, 3);
+        
+        vector<uint64_t> dirChain = getChain(context.currentContentCluster);
+        int foundSector = -1, foundIdx = -1;
+        bool isNew = true;
+        DirEntry foundEntry;
+        
+        for (uint64_t c : dirChain) {
+            for (int i = 0; i < 8; i++) {
+                uint8_t sec[SECTOR_SIZE];
+                disk.readSector(c * 8 + i, sec);
+                DirEntry* des = (DirEntry*)sec;
+                for (int j = 0; j < SECTOR_SIZE / sizeof(DirEntry); j++) {
+                    if (des[j].type == TYPE_FILE && string(des[j].name) == name) {
+                        foundEntry = des[j];
+                        isNew = false;
+                        foundSector = (c * 8) + i;
+                        foundIdx = j;
+                        goto import_scan_done;
+                    }
+                }
+            }
+        }
+        
+        for (uint64_t c : dirChain) {
+            for (int i = 0; i < 8; i++) {
+                uint8_t sec[SECTOR_SIZE];
+                disk.readSector(c * 8 + i, sec);
+                DirEntry* des = (DirEntry*)sec;
+                for (int j = 0; j < SECTOR_SIZE / sizeof(DirEntry); j++) {
+                    if (des[j].type == TYPE_FREE) {
+                        foundSector = (c * 8) + i;
+                        foundIdx = j;
+                        goto import_scan_done;
+                    }
+                }
+            }
+        }
+        lout << "Directory full.\n";
+        fclose(hostFile);
+        return;
+        
+import_scan_done:
+        uint64_t txId = journal->logOperation(OP_WRITE, context.currentContentCluster, name);
+        
+        uint8_t sectorData[SECTOR_SIZE];
+        disk.readSector(foundSector, sectorData);
+        DirEntry* entryPtr = (DirEntry*)sectorData + foundIdx;
+        
+        if (isNew) {
+            memset(entryPtr, 0, sizeof(DirEntry));
+            entryPtr->type = TYPE_FILE;
+            strncpy(entryPtr->name, name.c_str(), 23);
+            strncpy(entryPtr->extension, ext.c_str(), 3);
+            entryPtr->startCluster = allocCluster();
+            entryPtr->createTime = time(0);
+            entryPtr->attributes = PERM_DEFAULT;
+            if (entryPtr->startCluster == 0) {
+                lout << "Disk full.\n";
+                fclose(hostFile);
+                return;
+            }
+        }
+        
+        entryPtr->modTime = time(0);
+        entryPtr->size = fileSize;
+        
+        uint64_t clustersNeeded = (fileSize + CLUSTER_SIZE - 1) / CLUSTER_SIZE;
+        if (clustersNeeded == 0) clustersNeeded = 1;
+        
+        vector<uint64_t> clusterChain;
+        clusterChain.reserve(clustersNeeded);
+        
+        uint64_t firstCluster = entryPtr->startCluster;
+        if (firstCluster == 0) {
+            firstCluster = allocCluster();
+            if (firstCluster == 0) {
+                lout << "Disk full.\n";
+                fclose(hostFile);
+                return;
+            }
+            entryPtr->startCluster = firstCluster;
+        }
+        clusterChain.push_back(firstCluster);
+        
+        for (uint64_t i = 1; i < clustersNeeded; i++) {
+            uint64_t next = allocCluster();
+            if (next == 0) {
+                lout << "Disk full. Pre-allocation failed at cluster " << i << "\n";
+                fclose(hostFile);
+                return;
+            }
+            setLATEntry(clusterChain.back(), next);
+            clusterChain.push_back(next);
+        }
+        setLATEntry(clusterChain.back(), LAT_END);
+        
+        disk.writeSector(foundSector, sectorData);
+        
+        TransferProgress progress(fileSize, "Import");
+        
+        vector<vector<uint8_t>> buffers(clustersNeeded);
+        for (auto& buf : buffers) buf.resize(CLUSTER_SIZE, 0);
+        
+        uint64_t remaining = fileSize;
+        for (size_t i = 0; i < clustersNeeded && remaining > 0; i++) {
+            size_t toRead = min((uint64_t)CLUSTER_SIZE, remaining);
+            fread(buffers[i].data(), 1, toRead, hostFile);
+            remaining -= toRead;
+        }
+        fclose(hostFile);
+        
+        atomic<uint64_t> bytesWritten(0);
+        mutex progressMutex;
+        
+        auto writeCluster = [&](size_t idx) {
+            uint64_t cluster = clusterChain[idx];
+            for (int s = 0; s < 8; s++) {
+                disk.writeSector(cluster * 8 + s, buffers[idx].data() + s * SECTOR_SIZE);
+            }
+            size_t written = min((uint64_t)CLUSTER_SIZE, fileSize - idx * CLUSTER_SIZE);
+            bytesWritten += written;
+            
+            lock_guard<mutex> lock(progressMutex);
+            progress.update(bytesWritten, written);
+        };
+        
+        vector<future<void>> futures;
+        for (size_t i = 0; i < clusterChain.size(); i++) {
+            futures.push_back(threadPool.enqueue(writeCluster, i));
+        }
+        
+        for (auto& f : futures) {
+            f.wait();
+        }
+        
+        journal->commitOperation(txId);
+        progress.finish();
+        lout << "Imported " << fileSize << " bytes as '" << name;
+        if (!ext.empty()) lout << "." << ext;
+        lout << "' (parallel, " << clusterChain.size() << " clusters)\n";
+    }
+    
+    void exportFile(const string& lfsPath, const string& hostPath) {
+        if (!disk.isOpen()) { lout << "Not mounted.\n"; return; }
+        
+        PathResult res = resolvePath(lfsPath);
+        if (!res.valid) { lout << "File not found.\n"; return; }
+        
+        DirEntry foundEntry;
+        bool found = false;
+        vector<uint64_t> chain = getChain(res.parentCluster);
+        
+        for (uint64_t c : chain) {
+            for (int i = 0; i < 8; i++) {
+                uint8_t sec[SECTOR_SIZE];
+                disk.readSector(c * 8 + i, sec);
+                DirEntry* des = (DirEntry*)sec;
+                for (int j = 0; j < SECTOR_SIZE / sizeof(DirEntry); j++) {
+                    if (des[j].type == TYPE_FILE && string(des[j].name) == res.name) {
+                        foundEntry = des[j];
+                        found = true;
+                        goto export_found;
+                    }
+                }
+            }
+        }
+        
+export_found:
+        if (!found) { lout << "File not found: " << lfsPath << "\n"; return; }
+        if (!(foundEntry.attributes & PERM_READ)) {
+            lout << "Permission denied: no read access.\n";
+            return;
+        }
+        
+        FILE* hostFile = fopen(hostPath.c_str(), "wb");
+        if (!hostFile) {
+            lout << "Cannot create host file: " << hostPath << "\n";
+            return;
+        }
+        
+        vector<uint64_t> fileChain = getChain(foundEntry.startCluster);
+        uint64_t remaining = foundEntry.size;
+        uint64_t total = foundEntry.size;
+        uint8_t buffer[CLUSTER_SIZE];
+        
+        TransferProgress progress(total, "Export");
+        
+        for (uint64_t c : fileChain) {
+            if (remaining == 0) break;
+            
+            for (int i = 0; i < 8; i++) {
+                disk.readSector(c * 8 + i, buffer + (i * SECTOR_SIZE));
+            }
+            
+            size_t toWrite = min((uint64_t)CLUSTER_SIZE, remaining);
+            fwrite(buffer, 1, toWrite, hostFile);
+            remaining -= toWrite;
+            progress.update(total - remaining, toWrite);
+        }
+        
+        fclose(hostFile);
+        progress.finish();
+        lout << "Exported " << foundEntry.size << " bytes to '" << hostPath << "'\n";
+    }
+    
+    void executeFile(const string& path, const string& args) {
+        if (!disk.isOpen()) { lout << "Not mounted.\n"; return; }
+        
+        PathResult res = resolvePath(path);
+        if (!res.valid) { lout << "File not found: " << path << "\n"; return; }
+        string searchName = res.name;
+        string searchExt = "";
+        size_t dotPos = res.name.find_last_of('.');
+        if (dotPos != string::npos && dotPos > 0) {
+            searchName = res.name.substr(0, dotPos);
+            searchExt = res.name.substr(dotPos + 1);
+        }
+        
+        DirEntry foundEntry;
+        bool found = false;
+        vector<uint64_t> chain = getChain(res.parentCluster);
+        
+        for (uint64_t c : chain) {
+            for (int i = 0; i < 8; i++) {
+                uint8_t sec[SECTOR_SIZE];
+                disk.readSector(c * 8 + i, sec);
+                DirEntry* des = (DirEntry*)sec;
+                for (int j = 0; j < SECTOR_SIZE / sizeof(DirEntry); j++) {
+                    if (des[j].type == TYPE_FILE) {
+                        bool nameMatch = (string(des[j].name) == searchName);
+                        bool extMatch = searchExt.empty() || (string(des[j].extension) == searchExt);
+                        if (nameMatch && extMatch) {
+                            foundEntry = des[j];
+                            found = true;
+                            goto exec_found;
+                        }
+                    }
+                }
+            }
+        }
+        
+exec_found:
+        if (!found) { lout << "File not found: " << path << "\n"; return; }
+        if (!(foundEntry.attributes & PERM_EXEC)) {
+            lout << "Permission denied: no execute permission.\n";
+            return;
+        }
+        
+        char tempPath[MAX_PATH];
+        GetTempPathA(MAX_PATH, tempPath);
+        string tempFile = string(tempPath) + "lfs_exec_" + foundEntry.name;
+        if (foundEntry.extension[0] != '\0') {
+            tempFile += ".";
+            tempFile += foundEntry.extension;
+        }
+        
+        FILE* outFile = fopen(tempFile.c_str(), "wb");
+        if (!outFile) {
+            lout << "Cannot create temp file.\n";
+            return;
+        }
+        
+        vector<uint64_t> fileChain = getChain(foundEntry.startCluster);
+        uint64_t remaining = foundEntry.size;
+        uint8_t buffer[CLUSTER_SIZE];
+        
+        for (uint64_t c : fileChain) {
+            if (remaining == 0) break;
+            
+            for (int i = 0; i < 8; i++) {
+                disk.readSector(c * 8 + i, buffer + (i * SECTOR_SIZE));
+            }
+            
+            size_t toWrite = min((uint64_t)CLUSTER_SIZE, remaining);
+            fwrite(buffer, 1, toWrite, outFile);
+            remaining -= toWrite;
+        }
+        fclose(outFile);
+        
+        string cmdLine = "\"" + tempFile + "\"";
+        if (!args.empty()) cmdLine += " " + args;
+        
+        STARTUPINFOA si;
+        PROCESS_INFORMATION pi;
+        ZeroMemory(&si, sizeof(si));
+        si.cb = sizeof(si);
+        ZeroMemory(&pi, sizeof(pi));
+        
+        char cmdBuf[4096];
+        strncpy(cmdBuf, cmdLine.c_str(), sizeof(cmdBuf) - 1);
+        
+        if (CreateProcessA(NULL, cmdBuf, NULL, NULL, FALSE, 0, NULL, NULL, &si, &pi)) {
+            WaitForSingleObject(pi.hProcess, INFINITE);
+            
+            DWORD exitCode;
+            GetExitCodeProcess(pi.hProcess, &exitCode);
+            
+            CloseHandle(pi.hProcess);
+            CloseHandle(pi.hThread);
+            
+            if (exitCode != 0) {
+                lout << "[Exit code: " << exitCode << "]\n";
+            }
+        } else {
+            lout << "Failed to execute. Error: " << GetLastError() << "\n";
+        }
+        
+        DeleteFileA(tempFile.c_str());
+    }
+    
     uint64_t getCurrentLevelID() { return context.currentLevelID; }
     string getCurrentPath() { return context.currentPath; }
     string getCurrentVersion() { return context.currentVersion; }
+    
+    bool isRootFSInitialized() {
+        if (!disk.isOpen()) return false;
+        if (context.rootContentCluster == 0) return false;
+        
+        bool hasLocal = false, hasData = false;
+        vector<DirEntry> entries = readDirEntries(context.rootContentCluster);
+        
+        for (const auto& e : entries) {
+            if (e.type == TYPE_LEVELED_DIR) {
+                if (string(e.name) == "local") hasLocal = true;
+                if (string(e.name) == "data") hasData = true;
+            }
+        }
+        return hasLocal && hasData;
+    }
+    
+    void rootfsInit() {
+        if (!disk.isOpen()) return;
+        
+        lout << "Initializing RootFS structure...\n";
+        
+        NavigationContext savedCtx = context;
+        context.currentContentCluster = context.rootContentCluster;
+        context.currentPath = "/";
+        context.currentVersion = "master";
+        context.currentFolderPerms = PERM_ROOT_DEFAULT;
+        
+        createInCluster(context.rootContentCluster, "folder", "local", "");
+        createInCluster(context.rootContentCluster, "folder", "data", "");
+        
+        vector<DirEntry> entries = readDirEntries(context.rootContentCluster);
+        uint64_t dataCluster = 0;
+        for (const auto& e : entries) {
+            if (e.type == TYPE_LEVELED_DIR && string(e.name) == "data") {
+                dataCluster = e.startCluster;
+                break;
+            }
+        }
+        
+        if (dataCluster != 0) {
+            char vpsBuf[SECTOR_SIZE];
+            disk.readSector(dataCluster * 8, vpsBuf);
+            VersionEntry* vps = (VersionEntry*)vpsBuf;
+            
+            for (int j = 0; j < SECTOR_SIZE / sizeof(VersionEntry); j++) {
+                if (vps[j].isActive && string(vps[j].versionName) == "master") {
+                    uint64_t dataContent = vps[j].contentTableCluster;
+                    createInCluster(dataContent, "file", "var", "dat");
+                    break;
+                }
+            }
+        }
+        
+        context = savedCtx;
+        lout << "RootFS initialized: /local, /data, /data/var.dat\n";
+    }
+    
+    void loadVariables() {
+        if (!disk.isOpen()) return;
+        variables.clear();
+        
+        vector<DirEntry> rootEntries = readDirEntries(context.rootContentCluster);
+        uint64_t dataCluster = 0;
+        for (const auto& e : rootEntries) {
+            if (e.type == TYPE_LEVELED_DIR && string(e.name) == "data") {
+                dataCluster = e.startCluster;
+                break;
+            }
+        }
+        if (dataCluster == 0) return;
+        
+        char vpsBuf[SECTOR_SIZE];
+        disk.readSector(dataCluster * 8, vpsBuf);
+        VersionEntry* vps = (VersionEntry*)vpsBuf;
+        uint64_t dataContent = 0;
+        
+        for (int j = 0; j < SECTOR_SIZE / sizeof(VersionEntry); j++) {
+            if (vps[j].isActive && string(vps[j].versionName) == "master") {
+                dataContent = vps[j].contentTableCluster;
+                break;
+            }
+        }
+        if (dataContent == 0) return;
+        
+        vector<DirEntry> dataEntries = readDirEntries(dataContent);
+        DirEntry varEntry;
+        bool found = false;
+        for (const auto& e : dataEntries) {
+            if (e.type == TYPE_FILE && string(e.name) == "var") {
+                varEntry = e;
+                found = true;
+                break;
+            }
+        }
+        if (!found || varEntry.size == 0) return;
+        
+        vector<uint64_t> chain = getChain(varEntry.startCluster);
+        string content;
+        uint64_t remaining = varEntry.size;
+        
+        for (uint64_t c : chain) {
+            if (remaining == 0) break;
+            char buffer[CLUSTER_SIZE];
+            for (int i = 0; i < 8; i++) {
+                disk.readSector(c * 8 + i, buffer + i * SECTOR_SIZE);
+            }
+            size_t toRead = min((uint64_t)CLUSTER_SIZE, remaining);
+            content.append(buffer, toRead);
+            remaining -= toRead;
+        }
+        
+        istringstream iss(content);
+        string line;
+        while (getline(iss, line)) {
+            size_t eq = line.find('=');
+            if (eq != string::npos) {
+                string name = line.substr(0, eq);
+                string value = line.substr(eq + 1);
+                if (value.front() == '"' && value.back() == '"') {
+                    value = value.substr(1, value.length() - 2);
+                }
+                variables[name] = value;
+            }
+        }
+    }
+    
+    void declareVariable(const string& name, const string& value) {
+        variables[name] = value;
+        
+        vector<DirEntry> rootEntries = readDirEntries(context.rootContentCluster);
+        uint64_t dataCluster = 0;
+        for (const auto& e : rootEntries) {
+            if (e.type == TYPE_LEVELED_DIR && string(e.name) == "data") {
+                dataCluster = e.startCluster;
+                break;
+            }
+        }
+        if (dataCluster == 0) { lout << "Error: /data not found\n"; return; }
+        
+        char vpsBuf[SECTOR_SIZE];
+        disk.readSector(dataCluster * 8, vpsBuf);
+        VersionEntry* vps = (VersionEntry*)vpsBuf;
+        uint64_t dataContent = 0;
+        
+        for (int j = 0; j < SECTOR_SIZE / sizeof(VersionEntry); j++) {
+            if (vps[j].isActive && string(vps[j].versionName) == "master") {
+                dataContent = vps[j].contentTableCluster;
+                break;
+            }
+        }
+        if (dataContent == 0) { lout << "Error: /data:master not found\n"; return; }
+        
+        string varContent;
+        for (const auto& [k, v] : variables) {
+            varContent += k + "=\"" + v + "\"\n";
+        }
+        
+        vector<DirEntry> dataEntries = readDirEntries(dataContent);
+        for (uint64_t c : getChain(dataContent)) {
+            for (int i = 0; i < 8; i++) {
+                uint8_t sec[SECTOR_SIZE];
+                disk.readSector(c * 8 + i, sec);
+                DirEntry* des = (DirEntry*)sec;
+                for (int j = 0; j < SECTOR_SIZE / sizeof(DirEntry); j++) {
+                    if (des[j].type == TYPE_FILE && string(des[j].name) == "var") {
+                        uint64_t fileCluster = des[j].startCluster;
+                        if (fileCluster == 0) {
+                            fileCluster = allocCluster();
+                            des[j].startCluster = fileCluster;
+                        }
+                        
+                        des[j].size = varContent.size();
+                        des[j].modTime = time(0);
+                        disk.writeSector(c * 8 + i, sec);
+                        
+                        uint8_t buffer[CLUSTER_SIZE];
+                        memset(buffer, 0, CLUSTER_SIZE);
+                        memcpy(buffer, varContent.c_str(), min(varContent.size(), (size_t)CLUSTER_SIZE));
+                        for (int s = 0; s < 8; s++) {
+                            disk.writeSector(fileCluster * 8 + s, buffer + s * SECTOR_SIZE);
+                        }
+                        setLATEntry(fileCluster, LAT_END);
+                        
+                        lout << "Variable set: " << name << "=" << value << "\n";
+                        return;
+                    }
+                }
+            }
+        }
+        lout << "Error: var.dat not found\n";
+    }
+    
+    string expandVariables(const string& input) {
+        string result = input;
+        size_t pos = 0;
+        while ((pos = result.find('$', pos)) != string::npos) {
+            size_t end = pos + 1;
+            while (end < result.length() && (isalnum(result[end]) || result[end] == '_')) {
+                end++;
+            }
+            string varName = result.substr(pos + 1, end - pos - 1);
+            if (!varName.empty() && variables.count(varName)) {
+                result.replace(pos, end - pos, variables[varName]);
+                pos += variables[varName].length();
+            } else {
+                pos++;
+            }
+        }
+        return result;
+    }
+    
+    bool tryExecuteFromLocal(const string& cmd, const string& args) {
+        vector<DirEntry> rootEntries = readDirEntries(context.rootContentCluster);
+        uint64_t localCluster = 0;
+        for (const auto& e : rootEntries) {
+            if (e.type == TYPE_LEVELED_DIR && string(e.name) == "local") {
+                localCluster = e.startCluster;
+                break;
+            }
+        }
+        if (localCluster == 0) return false;
+        
+        char vpsBuf[SECTOR_SIZE];
+        disk.readSector(localCluster * 8, vpsBuf);
+        VersionEntry* vps = (VersionEntry*)vpsBuf;
+        uint64_t localContent = 0;
+        
+        for (int j = 0; j < SECTOR_SIZE / sizeof(VersionEntry); j++) {
+            if (vps[j].isActive && string(vps[j].versionName) == "master") {
+                localContent = vps[j].contentTableCluster;
+                break;
+            }
+        }
+        if (localContent == 0) return false;
+        
+        vector<DirEntry> localEntries = readDirEntries(localContent);
+        for (const auto& e : localEntries) {
+            if (e.type == TYPE_FILE && string(e.name) == cmd) {
+                if (!(e.attributes & PERM_EXEC)) {
+                    lout << cmd << ": permission denied (no +x)\n";
+                    return true;
+                }
+                
+                NavigationContext savedCtx = context;
+                context.currentContentCluster = localContent;
+                executeFile(cmd, args);
+                context = savedCtx;
+                return true;
+            }
+        }
+        return false;
+    }
 };
 
 int main(int argc, char** argv) {
@@ -3477,6 +4017,8 @@ int main(int argc, char** argv) {
     lout << "==========================================\n";
     lout << "Type 'help' for commands.\n";
     lout << "Type 'log on' to see disk operations.\n\n";
+    
+
     
     if (argc > 1) {
         string arg = argv[1];
@@ -3493,9 +4035,6 @@ int main(int argc, char** argv) {
         return 1;
     }
 
-    static IVfsPlatform* g_vfsPlatform = nullptr;
-    static LevelFSProvider* g_vfsProvider = nullptr;
-    
     while (true) {
         lout << "\n";
         try {
@@ -3510,11 +4049,21 @@ int main(int argc, char** argv) {
 
         lout << "\n";
 
-            stringstream ss(input);
+            bool runInBackground = false;
+            string trimmedInput = input;
+            while (!trimmedInput.empty() && isspace(trimmedInput.back())) trimmedInput.pop_back();
+            if (!trimmedInput.empty() && trimmedInput.back() == '&') {
+                runInBackground = true;
+                trimmedInput.pop_back();
+                while (!trimmedInput.empty() && isspace(trimmedInput.back())) trimmedInput.pop_back();
+            }
+
+            stringstream ss(trimmedInput);
             string cmd;
             ss >> cmd;
 
             if (cmd == "exit") break;
+            if (cmd == "jobs") { fs.listBackgroundTasks(); continue; }
             if (cmd == "mount") {
                 string arg; ss >> arg;
                 if (arg == "auto") {
@@ -3527,56 +4076,7 @@ int main(int argc, char** argv) {
                     lout << "Error: Invalid argument '" << arg << "'. Use a drive letter (e.g., D) or 'auto'.\n";
                 }
             }
-            else if (cmd == "vfsmount") {
-                string driveLetter; ss >> driveLetter;
-                if (!fs.isMounted()) {
-                    lout << "Error: No LevelFS image mounted. Use 'mount' first.\n";
-                } else if (driveLetter.empty()) {
-                    lout << "Usage: vfsmount <DriveLetter>\n";
-                    lout << "  Example: vfsmount Z\n";
-                    lout << "  Mounts the current LevelFS image as a Windows drive.\n";
-                    lout << "  Requires WinFsp to be installed.\n";
-                } else {
-                    if (g_vfsPlatform && g_vfsPlatform->isMounted()) {
-                        lout << "VFS already mounted at " << g_vfsPlatform->getMountPoint() << "\n";
-                        lout << "Use 'vfsunmount' first.\n";
-                    } else {
-                        if (!g_vfsProvider) g_vfsProvider = new LevelFSProvider();
-                        if (!g_vfsPlatform) g_vfsPlatform = createWinFspPlatform();
-                        
-                        if (!g_vfsPlatform) {
-                            lout << "Error: WinFsp platform not available.\n";
-                        } else {
-                            g_vfsProvider->attach(&fs);
-                            
-                            VfsMountOptions opts;
-                            opts.mountPoint = string(1, toupper(driveLetter[0])) + ":";
-                            opts.volumeName = string(fs.getSuperBlock().volumeName);
-                            opts.sectorSize = SECTOR_SIZE;
-                            opts.sectorsPerCluster = SECTORS_PER_CLUSTER;
-                            
-                            int result = g_vfsPlatform->mount(opts, g_vfsProvider);
-                            if (result == 0) {
-                                lout << "VFS mounted at " << g_vfsPlatform->getMountPoint() << "\n";
-                                lout << "LevelFS is now accessible as a Windows drive.\n";
-                            } else {
-                                lout << "VFS mount failed: " << g_vfsPlatform->getLastErrorString() << "\n";
-                                g_vfsProvider->detach();
-                            }
-                        }
-                    }
-                }
-            }
-            else if (cmd == "vfsunmount") {
-                if (g_vfsPlatform && g_vfsPlatform->isMounted()) {
-                    string mp = g_vfsPlatform->getMountPoint();
-                    g_vfsPlatform->unmount();
-                    if (g_vfsProvider) g_vfsProvider->detach();
-                    lout << "VFS unmounted from " << mp << "\n";
-                } else {
-                    lout << "No VFS mount active.\n";
-                }
-            }
+
             else if (cmd == "log") {
                 string state; ss >> state;
                 if (state == "on") fs.setVerbose(true);
@@ -3603,8 +4103,14 @@ int main(int argc, char** argv) {
             }
             else if (cmd == "dir-tree") fs.dirTree();
             else if (cmd == "create") {
-                string type, name, ext;
-                ss >> type >> name >> ext;
+                string type, fullName;
+                ss >> type >> fullName;
+                string name = fullName, ext = "";
+                size_t dot = fullName.find_last_of('.');
+                if (dot != string::npos && dot > 0) {
+                    name = fullName.substr(0, dot);
+                    ext = fullName.substr(dot + 1);
+                }
                 fs.create(type, name, ext);
             }
             else if (cmd == "nav") {
@@ -3718,11 +4224,11 @@ int main(int argc, char** argv) {
                 lout << "  dir-tree      - Display directory tree\n";
                 lout << "  current       - Show current path and level\n";
                 lout << "  levels        - List all levels in registry\n";
-                lout << "  create folder <n> - Create folder\n";
-                lout << "  create file <n> [ext] - Create file (e.g. readme txt)\n";
-                lout << "  write <name>  - Text editor for file\n";
-                lout << "  write insert <name> - Insert line at position (arrow keys)\n";
-                lout << "  read <name>   - Read file contents\n";
+                lout << "  create folder <name> - Create folder\n";
+                lout << "  create file <name.ext> - Create file (e.g. readme.txt)\n";
+                lout << "  write <name.ext>  - Text editor for file\n";
+                lout << "  write insert <name.ext> - Insert line at position (arrow keys)\n";
+                lout << "  read <name.ext>   - Read file contents\n";
                 lout << "  rename <path> <newname> - Rename file/folder/level\n";
                 lout << "  perms <+/-rwx> <file> - Set permissions (+r,-w,+x...)\n";
                 lout << "  symlink <target> <link> - Create symbolic link\n";
@@ -3735,6 +4241,9 @@ int main(int argc, char** argv) {
                 lout << "  level branch <f> <p> <n> - Branch level from parent\n";
                 lout << "  level remove <f> <n> - Remove level from folder/.\n";
                 lout << "  link <dir1> <dir2> <level> - Create shared level (DAG)\n";
+                lout << "  import <host-path> [name.ext] - Import file from host\n";
+                lout << "  export <name.ext> <host> - Export file to host\n";
+                lout << "./<name.ext>      - Execute binary (requires +x)\n";
                 lout << "  fsck          - Check filesystem integrity\n";
                 lout << "  fraginfo      - Show fragmentation info\n";
                 lout << "  defrag [-nvfr] - Defragment disk\n";
@@ -3742,6 +4251,9 @@ int main(int argc, char** argv) {
                 lout << "                  -v/--verbose: detailed output\n";
                 lout << "                  -f/--force: force processing\n";
                 lout << "                  -r/--recursive: include subdirs\n";
+                lout << "  declare <n>=<v> - Set variable (use $n to expand)\n";
+                lout << "  jobs          - List background tasks\n";
+                lout << "  <command> &   - Run command in background\n";
                 lout << "  exit          - Exit\n";
             }
             else if (cmd == "fsck") fs.fsck();
@@ -3752,7 +4264,73 @@ int main(int argc, char** argv) {
                 if (flags.empty()) fs.defrag();
                 else fs.defragWithFlags(flags);
             }
-            else lout << "Unknown command. Type 'help' for list.\n";
+            else if (cmd == "import") {
+                string rest;
+                getline(ss, rest);
+                if (rest.empty() || (rest.length() == 1 && rest[0] == ' ')) {
+                    lout << "Usage: import <host-path> [lfs-name]\n";
+                } else {
+                    if (rest[0] == ' ') rest = rest.substr(1);
+                    string hostPath, lfsName;
+                    if (rest[0] == '"') {
+                        size_t endQuote = rest.find('"', 1);
+                        if (endQuote != string::npos) {
+                            hostPath = rest.substr(1, endQuote - 1);
+                            string remaining = rest.substr(endQuote + 1);
+                            stringstream rem(remaining);
+                            rem >> lfsName;
+                        } else {
+                            hostPath = rest;
+                        }
+                    } else {
+                        stringstream argss(rest);
+                        argss >> hostPath >> lfsName;
+                    }
+                    fs.importFile(hostPath, lfsName);
+                }
+            }
+            else if (cmd == "export") {
+                string lfsPath, hostPath;
+                ss >> lfsPath >> hostPath;
+                if (lfsPath.empty() || hostPath.empty()) {
+                    lout << "Usage: export <lfs-path> <host-path>\n";
+                } else {
+                    fs.exportFile(lfsPath, hostPath);
+                }
+            }
+            else if (cmd.length() >= 2 && cmd.substr(0, 2) == "./") {
+                string binary = cmd.substr(2);
+                string args;
+                getline(ss, args);
+                if (!args.empty() && args[0] == ' ') args = args.substr(1);
+                args = fs.expandVariables(args);
+                fs.executeFile(binary, args);
+            }
+            else if (cmd == "declare") {
+                string rest;
+                getline(ss, rest);
+                if (!rest.empty() && rest[0] == ' ') rest = rest.substr(1);
+                size_t eq = rest.find('=');
+                if (eq == string::npos) {
+                    lout << "Usage: declare <name>=<value> or declare <name>=\"string\"\n";
+                } else {
+                    string name = rest.substr(0, eq);
+                    string value = rest.substr(eq + 1);
+                    if (value.front() == '"' && value.back() == '"') {
+                        value = value.substr(1, value.length() - 2);
+                    }
+                    fs.declareVariable(name, value);
+                }
+            }
+            else {
+                string args;
+                getline(ss, args);
+                if (!args.empty() && args[0] == ' ') args = args.substr(1);
+                args = fs.expandVariables(args);
+                if (!fs.tryExecuteFromLocal(cmd, args)) {
+                    lout << "Unknown command. Type 'help' for list.\n";
+                }
+            }
         } catch (const exception& e) {
             lout << "Error: " << e.what() << "\n";
         } catch (...) {
