@@ -13,6 +13,7 @@
 #include "lstream.hpp"
 #include "utils/handler.hpp"
 #include "utils/handler.cpp"
+#include "scheduler.hpp"
 
 class FileSystemShell {
     DiskDevice disk;
@@ -22,6 +23,7 @@ class FileSystemShell {
     
     ThreadPool threadPool;
     TaskHandler taskHandler;
+    ProcessScheduler scheduler;
     
     PermissionCache permCache;
     EntryReader* entryReader;
@@ -156,6 +158,15 @@ public:
                 rootfsInit();
             }
             loadVariables();
+            
+            scheduler.setFileCallbacks(
+                [this](const string& path) -> string { return readFileContent(path); },
+                [this](const string& path, const string& content) { writeFileContent(path, content); },
+                [this](const string& path) -> bool { return fileExists(path); },
+                [this](const string& path) -> string { return extractFileToTemp(path); }
+            );
+            scheduler.setStartupFile("/data/startup.prc");
+            scheduler.loadStartupProcesses();
             
             taskHandler.startOptimizer([this]() {
             }, 60000);
@@ -3963,6 +3974,164 @@ exec_found:
         return result;
     }
     
+    string readFileContent(const string& path) {
+        PathResult res = resolvePath(path);
+        if (!res.valid) return "";
+        
+        FileParts fp = parseFileName(res.name);
+        vector<uint64_t> chain = getChain(res.parentCluster);
+        
+        for (uint64_t c : chain) {
+            for (int i = 0; i < 8; i++) {
+                uint8_t sec[SECTOR_SIZE];
+                disk.readSector(c * 8 + i, sec);
+                DirEntry* des = (DirEntry*)sec;
+                for (int j = 0; j < SECTOR_SIZE / sizeof(DirEntry); j++) {
+                    if (des[j].type == TYPE_FILE && matchesEntry(des[j], fp)) {
+                        string content;
+                        vector<uint64_t> fileChain = getChain(des[j].startCluster);
+                        uint64_t remaining = des[j].size;
+                        
+                        for (uint64_t fc : fileChain) {
+                            if (remaining == 0) break;
+                            char buffer[CLUSTER_SIZE];
+                            for (int s = 0; s < 8; s++) {
+                                disk.readSector(fc * 8 + s, buffer + s * SECTOR_SIZE);
+                            }
+                            size_t toRead = min((uint64_t)CLUSTER_SIZE, remaining);
+                            content.append(buffer, toRead);
+                            remaining -= toRead;
+                        }
+                        return content;
+                    }
+                }
+            }
+        }
+        return "";
+    }
+    
+    void writeFileContent(const string& path, const string& content) {
+        PathResult res = resolvePath(path);
+        if (!res.valid) return;
+        
+        FileParts fp = parseFileName(res.name);
+        vector<uint64_t> chain = getChain(res.parentCluster);
+        
+        for (uint64_t c : chain) {
+            for (int i = 0; i < 8; i++) {
+                uint8_t sec[SECTOR_SIZE];
+                disk.readSector(c * 8 + i, sec);
+                DirEntry* des = (DirEntry*)sec;
+                for (int j = 0; j < SECTOR_SIZE / sizeof(DirEntry); j++) {
+                    if (des[j].type == TYPE_FILE && matchesEntry(des[j], fp)) {
+                        uint64_t fileCluster = des[j].startCluster;
+                        if (fileCluster == 0) {
+                            fileCluster = allocCluster();
+                            des[j].startCluster = fileCluster;
+                        }
+                        
+                        des[j].size = content.size();
+                        des[j].modTime = time(0);
+                        disk.writeSector(c * 8 + i, sec);
+                        
+                        uint8_t buffer[CLUSTER_SIZE];
+                        memset(buffer, 0, CLUSTER_SIZE);
+                        memcpy(buffer, content.c_str(), min(content.size(), (size_t)CLUSTER_SIZE));
+                        for (int s = 0; s < 8; s++) {
+                            disk.writeSector(fileCluster * 8 + s, buffer + s * SECTOR_SIZE);
+                        }
+                        setLATEntry(fileCluster, LAT_END);
+                        return;
+                    }
+                }
+            }
+        }
+    }
+    
+    bool fileExists(const string& path) {
+        PathResult res = resolvePath(path);
+        if (!res.valid) return false;
+        
+        FileParts fp = parseFileName(res.name);
+        vector<uint64_t> chain = getChain(res.parentCluster);
+        
+        for (uint64_t c : chain) {
+            for (int i = 0; i < 8; i++) {
+                uint8_t sec[SECTOR_SIZE];
+                disk.readSector(c * 8 + i, sec);
+                DirEntry* des = (DirEntry*)sec;
+                for (int j = 0; j < SECTOR_SIZE / sizeof(DirEntry); j++) {
+                    if (des[j].type != TYPE_FREE && matchesEntry(des[j], fp)) {
+                        return true;
+                    }
+                }
+            }
+        }
+        return false;
+    }
+    
+    ProcessScheduler& getScheduler() { return scheduler; }
+    
+    string extractFileToTemp(const string& lfsPath) {
+        PathResult res = resolvePath(lfsPath);
+        if (!res.valid) return "";
+        
+        FileParts fp = parseFileName(res.name);
+        vector<uint64_t> chain = getChain(res.parentCluster);
+        
+        DirEntry foundEntry;
+        bool found = false;
+        
+        for (uint64_t c : chain) {
+            for (int i = 0; i < 8; i++) {
+                uint8_t sec[SECTOR_SIZE];
+                disk.readSector(c * 8 + i, sec);
+                DirEntry* des = (DirEntry*)sec;
+                for (int j = 0; j < SECTOR_SIZE / sizeof(DirEntry); j++) {
+                    if (des[j].type == TYPE_FILE && matchesEntry(des[j], fp)) {
+                        foundEntry = des[j];
+                        found = true;
+                        goto extract_found;
+                    }
+                }
+            }
+        }
+        
+extract_found:
+        if (!found) return "";
+        
+        char tempPath[MAX_PATH];
+        GetTempPathA(MAX_PATH, tempPath);
+        
+        string tempFile = string(tempPath) + "lfs_proc_" + foundEntry.name;
+        if (foundEntry.extension[0] != '\0') {
+            tempFile += ".";
+            tempFile += foundEntry.extension;
+        }
+        
+        FILE* outFile = fopen(tempFile.c_str(), "wb");
+        if (!outFile) return "";
+        
+        vector<uint64_t> fileChain = getChain(foundEntry.startCluster);
+        uint64_t remaining = foundEntry.size;
+        uint8_t buffer[CLUSTER_SIZE];
+        
+        for (uint64_t c : fileChain) {
+            if (remaining == 0) break;
+            
+            for (int i = 0; i < 8; i++) {
+                disk.readSector(c * 8 + i, buffer + (i * SECTOR_SIZE));
+            }
+            
+            size_t toWrite = min((uint64_t)CLUSTER_SIZE, remaining);
+            fwrite(buffer, 1, toWrite, outFile);
+            remaining -= toWrite;
+        }
+        
+        fclose(outFile);
+        return tempFile;
+    }
+    
     bool tryExecuteFromLocal(const string& cmd, const string& args) {
         vector<DirEntry> rootEntries = readDirEntries(context.rootContentCluster);
         uint64_t localCluster = 0;
@@ -4063,7 +4232,49 @@ int main(int argc, char** argv) {
             ss >> cmd;
 
             if (cmd == "exit") break;
-            if (cmd == "jobs") { fs.listBackgroundTasks(); continue; }
+            if (cmd == "job") {
+                string sub; ss >> sub;
+                if (sub == "list" || sub.empty()) {
+                    fs.getScheduler().listProcesses();
+                }
+                else if (sub == "kill") {
+                    string pidStr; ss >> pidStr;
+                    if (pidStr.empty()) {
+                        lout << "Usage: job kill <pid>\n";
+                    } else {
+                        try {
+                            uint32_t pid = stoul(pidStr);
+                            fs.getScheduler().killProcess(pid);
+                        } catch (...) {
+                            lout << "Invalid PID: " << pidStr << "\n";
+                        }
+                    }
+                }
+                else if (sub == "start") {
+                    string prcPath; ss >> prcPath;
+                    if (prcPath.empty()) {
+                        lout << "Usage: job start <prc-file>\n";
+                    } else {
+                        string content = fs.readFileContent(prcPath);
+                        if (content.empty()) {
+                            lout << "Cannot read .prc file: " << prcPath << "\n";
+                        } else {
+                            fs.getScheduler().startFromPrcFile(content, prcPath);
+                        }
+                    }
+                }
+                else if (sub == "cleanup") {
+                    fs.getScheduler().cleanupTerminated();
+                }
+                else {
+                    lout << "Usage: job <list|kill|start|cleanup>\n";
+                    lout << "  job list             - List all managed processes\n";
+                    lout << "  job kill <pid>       - Kill process by PID\n";
+                    lout << "  job start <prc-file> - Start process from .prc file\n";
+                    lout << "  job cleanup          - Remove terminated processes\n";
+                }
+                continue;
+            }
             if (cmd == "mount") {
                 string arg; ss >> arg;
                 if (arg == "auto") {
@@ -4252,9 +4463,12 @@ int main(int argc, char** argv) {
                 lout << "                  -f/--force: force processing\n";
                 lout << "                  -r/--recursive: include subdirs\n";
                 lout << "  declare <n>=<v> - Set variable (use $n to expand)\n";
-                lout << "  jobs          - List background tasks\n";
-                lout << "  <command> &   - Run command in background\n";
-                lout << "  exit          - Exit\n";
+                lout << "  job list        - List managed processes\n";
+                lout << "  job kill <pid>  - Kill process by PID\n";
+                lout << "  job start <prc> - Start process from .prc file\n";
+                lout << "  job cleanup     - Remove terminated processes\n";
+                lout << "  <command> &     - Run command in background\n";
+                lout << "  exit            - Exit\n";
             }
             else if (cmd == "fsck") fs.fsck();
             else if (cmd == "fraginfo") fs.fragInfo();

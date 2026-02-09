@@ -15,6 +15,7 @@ A custom file system with **leveled folders** instead of traditional directories
 - **RootFS Auto-Init**: Automatic `/local` and `/data` directory initialization
 - **Variable System**: Declare variables with `$var` expansion support
 - **PATH-like Execution**: Run executables from `/local` without path prefix
+- **Process Scheduler**: Manage processes with .prc files, onReboot persistence
 - **Background Tasks**: Run commands in background with `&` suffix
 - **Defragmentation**: Built-in disk defragmentation with multiple options
 - **Filesystem Check**: Integrity checking via `fsck`
@@ -128,16 +129,41 @@ g++ src/fs.cpp -o bin/fs.exe -lole32 -lsetupapi
 | | `-f, --force`: Force processing |
 | | `-r, --recursive`: Include subdirectories |
 
+### Process Management
+
+| Command | Description |
+|---------|-------------|
+| `job list` | List all managed processes with PID, status, runtime |
+| `job kill <pid>` | Kill a process by its PID |
+| `job start <prc-file>` | Start a process from a .prc definition file |
+| `job cleanup` | Remove terminated processes from the list |
+
+#### .prc File Format
+
+Process definition files use this format:
+
+```
+[Process Name]:
+    Path: "path-to-executable";
+    Args: "arg1", "arg2", "arg3";
+    onReboot: true;
+.
+```
+
+- **Path**: Full path to the executable
+- **Args**: Comma-separated quoted arguments
+- **onReboot**: If `true`, process auto-starts on mount (saved to `/data/startup.prc`)
+
 ### Other Commands
 
 | Command | Description |
 |---------|-------------|
 | `mount <D\|auto>` | Mount drive letter or auto-scan |
 | `log <on\|off>` | Toggle disk operation logging |
-| `jobs` | List background tasks |
 | `<command> &` | Run command in background |
 | `help` | Show all commands |
 | `exit` | Exit shell |
+
 
 ## Structure Example
 
